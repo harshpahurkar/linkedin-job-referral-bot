@@ -1,0 +1,34 @@
+# Environment & secrets
+.env
+
+# Database and logs
+data/*.db
+data/logs/
+data/debug_page.html
+
+# Chrome profile and browser data
+Chrome Bot Data/
+ChromeProfile/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Misc
+*.log
+dump.rdb

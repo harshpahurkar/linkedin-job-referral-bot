@@ -1,0 +1,225 @@
+"""
+Data models for jobs, companies, and contacts — stored in SQLite.
+"""
+
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from config import Config
+
+
+@dataclass
+class Job:
+    job_id: str
+    title: str
+    company: str
+    location: str
+    url: str
+    description: str = ""
+    date_scraped: str = field(default_factory=lambda: datetime.now().isoformat())
+    applied: bool = False
+    referral_requested: bool = False
+
+
+@dataclass
+class Contact:
+    contact_id: str
+    name: str
+    first_name: str
+    profile_url: str
+    company: str
+    title: str = ""
+    location: str = ""
+    messaged: bool = False
+    message_date: str = ""
+    connected: bool = False
+
+
+class Database:
+    """Simple SQLite wrapper for persisting jobs and contacts."""
+
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path or Config.DB_PATH
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_tables()
+
+    # ── Schema ────────────────────────────────────────────────────────
+    def _init_tables(self):
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id       TEXT PRIMARY KEY,
+                title        TEXT,
+                company      TEXT,
+                location     TEXT,
+                url          TEXT,
+                description  TEXT,
+                date_scraped TEXT,
+                applied      INTEGER DEFAULT 0,
+                referral_requested INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS contacts (
+                contact_id   TEXT PRIMARY KEY,
+                name         TEXT,
+                first_name   TEXT,
+                profile_url  TEXT,
+                company      TEXT,
+                title        TEXT,
+                location     TEXT DEFAULT '',
+                messaged     INTEGER DEFAULT 0,
+                message_date TEXT,
+                connected    INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS run_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date  TEXT,
+                jobs_found     INTEGER,
+                messages_sent  INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS weekly_activity (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type     TEXT,
+                action_date     TEXT,
+                detail          TEXT
+            );
+            """
+        )
+        self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns that may be missing in older databases."""
+        # Get existing columns for the contacts table
+        cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(contacts)").fetchall()
+        }
+        if "location" not in cols:
+            self.conn.execute(
+                "ALTER TABLE contacts ADD COLUMN location TEXT DEFAULT ''"
+            )
+            self.conn.commit()
+
+    # ── Jobs ──────────────────────────────────────────────────────────
+    def clear_jobs(self):
+        """Delete all jobs so each run starts with a fresh scrape."""
+        self.conn.execute("DELETE FROM jobs")
+        self.conn.commit()
+
+    def insert_job(self, job: Job) -> bool:
+        """Insert a job if it doesn't already exist. Returns True if new."""
+        try:
+            self.conn.execute(
+                """INSERT INTO jobs
+                   (job_id, title, company, location, url, description, date_scraped)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job.job_id,
+                    job.title,
+                    job.company,
+                    job.location,
+                    job.url,
+                    job.description,
+                    job.date_scraped,
+                ),
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # already exists
+
+    def job_exists(self, job_id: str) -> bool:
+        """Check if a job with this ID is already in the database."""
+        row = self.conn.execute(
+            "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return row is not None
+
+    def get_jobs_without_referral(self) -> list[Job]:
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE referral_requested = 0"
+        ).fetchall()
+        return [Job(**dict(r)) for r in rows]
+
+    def mark_referral_requested(self, job_id: str):
+        self.conn.execute(
+            "UPDATE jobs SET referral_requested = 1 WHERE job_id = ?", (job_id,)
+        )
+        self.conn.commit()
+
+    # ── Contacts ──────────────────────────────────────────────────────
+    def insert_contact(self, contact: Contact) -> bool:
+        try:
+            self.conn.execute(
+                """INSERT INTO contacts
+                   (contact_id, name, first_name, profile_url, company, title, location)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    contact.contact_id,
+                    contact.name,
+                    contact.first_name,
+                    contact.profile_url,
+                    contact.company,
+                    contact.title,
+                    contact.location,
+                ),
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def mark_messaged(self, contact_id: str):
+        self.conn.execute(
+            "UPDATE contacts SET messaged = 1, message_date = ? WHERE contact_id = ?",
+            (datetime.now().isoformat(), contact_id),
+        )
+        self.conn.commit()
+
+    def already_messaged(self, contact_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT messaged FROM contacts WHERE contact_id = ?", (contact_id,)
+        ).fetchone()
+        return bool(row and row["messaged"])
+
+    # ── Run Log ───────────────────────────────────────────────────────
+    def log_run(self, jobs_found: int, messages_sent: int):
+        self.conn.execute(
+            "INSERT INTO run_log (run_date, jobs_found, messages_sent) VALUES (?, ?, ?)",
+            (datetime.now().isoformat(), jobs_found, messages_sent),
+        )
+        self.conn.commit()
+
+    # ── Weekly Activity Tracking ────────────────────────────────────
+    def log_activity(self, action_type: str, detail: str = ""):
+        """Log a profile_view or connection_request for weekly tracking."""
+        self.conn.execute(
+            "INSERT INTO weekly_activity (action_type, action_date, detail) VALUES (?, ?, ?)",
+            (action_type, datetime.now().isoformat(), detail),
+        )
+        self.conn.commit()
+
+    def get_weekly_count(self, action_type: str) -> int:
+        """Count actions of a given type in the last 7 days."""
+        seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        row = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM weekly_activity WHERE action_type = ? AND action_date >= ?",
+            (action_type, seven_days_ago),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    def weekly_profiles_viewed(self) -> int:
+        return self.get_weekly_count("profile_view")
+
+    def weekly_connections_sent(self) -> int:
+        return self.get_weekly_count("connection_request")
+
+    def close(self):
+        self.conn.close()

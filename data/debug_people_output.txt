@@ -1,0 +1,116 @@
+No company found, trying direct URL
+People URL: https://www.linkedin.com/company/reddit-com/people/
+
+============================================================
+{
+  "cardDetails": [
+    {
+      "className": "artdeco-entity-lockup artdeco-entity-lockup--size-1 ember-view",
+      "innerHTML": "\n                <div id=\"ember455\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-square ember-view\" type=\"square\">\n                  <img src=\"https://media.licdn.com/dms/image/v2/D560BAQFQPgrgVb19Kw/company-logo_100_100/company-logo_100_100/0/1701361977075/reddit_com_logo?e=1772668800&amp;v=beta&amp;t=EJqFWryqOeSg5_mHscmzwJ-zgjSAzrF6mCGubWQTiAE\" loading=\"lazy\" alt=\"Reddit, Inc. logo\" id=\"ember456\" class=\"evi-image lazy-image ember-view\">\n                \n</div>\n       ",
+      "outerHTML": "<div id=\"ember454\" class=\"artdeco-entity-lockup artdeco-entity-lockup--size-1 ember-view\">\n                <div id=\"ember455\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-square ember-view\" type=\"square\">\n                  <img src=\"https://media.licdn.com/dms/image/v2/D560",
+      "tag": "DIV"
+    },
+    {
+      "className": "artdeco-entity-lockup artdeco-entity-lockup--stacked-center artdeco-entity-lockup--size-7 ember-view",
+      "innerHTML": "\n          <div id=\"ember249\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-circle ember-view\" type=\"circle\">\n\n              <a class=\"kmvIqgjuYrAGalgeMjeAGNUYAMDmnbvvbfQ \" id=\"org-people-profile-card__profile-image-0\" href=\"https://www.linkedin.com/in/duclc?miniProfileUrn=urn%3Ali%3Afs_miniProfile%3AACoAAA_VKU0BHp-PR_hICEok5Pm8Q2aOwQ3Ln-I\" data-test-app-aware-link=\"\">\n                <img width=\"104\" src=\"https://media.licdn.com/dms/image/v2/D4D03AQGxnAeG4dZrZA/profile-",
+      "outerHTML": "<div id=\"ember248\" class=\"artdeco-entity-lockup artdeco-entity-lockup--stacked-center artdeco-entity-lockup--size-7 ember-view\">\n          <div id=\"ember249\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-circle ember-view\" type=\"circle\">\n\n              <a class=\"kmvIqgjuYrAG",
+      "tag": "DIV"
+    },
+    {
+      "className": "artdeco-entity-lockup artdeco-entity-lockup--stacked-center artdeco-entity-lockup--size-7 ember-view",
+      "innerHTML": "\n          <div id=\"ember265\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-circle ember-view\" type=\"circle\">\n\n              <a class=\"kmvIqgjuYrAGalgeMjeAGNUYAMDmnbvvbfQ \" id=\"org-people-profile-card__profile-image-1\" href=\"https://www.linkedin.com/in/j57chen?miniProfileUrn=urn%3Ali%3Afs_miniProfile%3AACoAABijvW0BJ17aug00Po0-OnEs4fkss-VpjsU\" data-test-app-aware-link=\"\">\n                <img width=\"104\" src=\"https://media.licdn.com/dms/image/v2/D5603AQHjiCbszxOX_Q/profil",
+      "outerHTML": "<div id=\"ember264\" class=\"artdeco-entity-lockup artdeco-entity-lockup--stacked-center artdeco-entity-lockup--size-7 ember-view\">\n          <div id=\"ember265\" class=\"artdeco-entity-lockup__image artdeco-entity-lockup__image--type-circle ember-view\" type=\"circle\">\n\n              <a class=\"kmvIqgjuYrAG",
+      "tag": "DIV"
+    }
+  ],
+  "containers": {
+    ".org-grid__content-container": null,
+    ".org-people__card-container": null,
+    ".scaffold-finite-scroll__content": {
+      "children": 1,
+      "tag": "DIV"
+    }
+  },
+  "peopleDivs": [
+    {
+      "childCount": 4,
+      "className": "artdeco-carousel ember-view org-people__carousel-container",
+      "tag": "SECTION"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    },
+    {
+      "childCount": 3,
+      "className": "org-people-bar-graph-element__percentage-bar-info truncate full-width mt2 mb1 t-14 t-black--light t-normal",
+      "tag": "DIV"
+    }
+  ],
+  "selectors": {
+    ".artdeco-card .scaffold-layout__list-item": 0,
+    ".artdeco-entity-lockup": 26,
+    ".artdeco-list__item": 13,
+    ".org-people-profile-card": 0,
+    ".org-people__card-container": 0,
+    ".scaffold-finite-scroll__content > li": 0,
+    "div[data-view-name=\"org-people-profile-card\"]": 0,
+    "section.org-people": 0
+  }
+}
+============================================================
+
+Found 40 people:
+  [lockup] Reddit, Inc. —  — 
+  [lockup] Duc Le — Machine Learning Engineer at Reddit — https://www.linkedin.com/in/duclc?miniProfileUrn=urn%3Ali%3A
+  [lockup] Jacky C. — MLE @ Reddit | MDSAI @ UWaterloo — https://www.linkedin.com/in/j57chen?miniProfileUrn=urn%3Ali%
+  [lockup] Aseem Anand — Engineering Leader at Reddit — https://www.linkedin.com/in/aseem-anand-90417816?miniProfile
+  [lockup] Shunqi Lu — Senior Android Engineer at Reddit — https://www.linkedin.com/in/shunqi-lu-liam?miniProfileUrn=ur
+  [lockup] Justin Lee — Machine Learning & AI — https://www.linkedin.com/in/jlee118?miniProfileUrn=urn%3Ali%
+  [lockup] Tudor Lupu — Software Engineer at Reddit — https://www.linkedin.com/in/tudor-lupu?miniProfileUrn=urn%3A
+  [lockup] William Granados — Software Developer at Reddit — https://www.linkedin.com/in/wlgranados?miniProfileUrn=urn%3A
+  [lockup] Matías Radzinski — Senior Android Engineer @ Reddit, Inc. | Software Engineerin — https://www.linkedin.com/in/matiasradzinski?miniProfileUrn=u
+  [lockup] Yiping Che — Software Engineer at Reddit — https://www.linkedin.com/in/yipingche?miniProfileUrn=urn%3Al
+
+Screenshot saved.
