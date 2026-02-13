@@ -1,6 +1,8 @@
+
 # 🤖 LinkedIn Job Referral Bot
 
-Automated daily pipeline that scrapes LinkedIn jobs, finds employees at those companies, and sends personalized referral-request connection notes — all hands-free.
+Automated pipeline that scrapes LinkedIn job listings, finds employees at target companies, and sends short, personalized referral-request connection notes. This README reflects the current codebase (multi-page scraping, relevance scoring, senior-role filtering, DM handling for already-connected contacts, and safer run patterns).
+
 
 ---
 
