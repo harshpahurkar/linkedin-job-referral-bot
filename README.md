@@ -115,14 +115,16 @@ python -c "import sqlite3; conn = sqlite3.connect('data/jobs.db'); [print(f'{r[0
 2. **Picks random daily target** — between `DAILY_TARGET_MIN` and `DAILY_TARGET_MAX` (looks human)
 3. **Clears old job data** — fresh scrape every run
 4. **Launches Chrome** — reuses your logged-in session
-5. **Scrapes jobs** — 5 keywords × 1 page each, jobs posted in last 24 hours
+5. **Scrapes jobs** — runs multi-page job searches for each configured keyword (default: 3 pages per keyword). Each job is scored by a relevance heuristic and the pipeline excludes senior-level roles by default.
 6. **For each company:**
-   - Searches the company's LinkedIn /people/ page
-   - Filters for **Canadian/North American** contacts only
-   - Picks 4 engineers + 1 recruiter (max 5 per company)
-   - Sends personalized connection note with referral ask
-   - Waits 45–120 seconds between sends (anti-detection)
-7. **Logs everything** — check `data/logs/bot.log`
+    - Try the company's `/people/` tab first for a natural-looking employee list; fall back to a People search when needed.
+    - People search uses network filters (1st/2nd/3rd degree) so already-connected contacts appear and can be DM'd.
+    - Extracts and validates only real `/in/` profile URLs, filters geo (Canadian / North American preferred) and relevant titles.
+    - Builds a larger candidate pool and then sends up to `MAX_MESSAGES_PER_COMPANY` successful outreach attempts — connections or DMs. The loop caps successful sends (not raw results) so the bot keeps iterating until the per-company quota of successful messages is reached or exhausted.
+    - If a contact is already connected and has not been messaged before, the bot will open the messaging overlay and send a DM (instead of skipping them).
+    - Default contact mix: up to 4 technical contacts + 1 recruiter (configurable in code).
+    - Waits between sends (human-like delays and longer waits after important actions).
+7. **Logs everything** — check `data/logs/bot.log` for per-job and per-company activity and run summary.
 
 ---
 
@@ -132,13 +134,16 @@ python -c "import sqlite3; conn = sqlite3.connect('data/jobs.db'); [print(f'{r[0
 |---|---|
 | **Randomized daily volume** | Random target each run so LinkedIn can't pattern-match |
 | **Weekly caps** | 180 connections/week, 1500 profile views/week |
-| **Per-company limit** | Max 5 people per company (4 tech + 1 recruiter) |
-| **Human-like delays** | 45–120s between sends, random pauses everywhere |
-| **Geo filtering** | Only messages Canadian/North American contacts |
-| **Company verification** | Verifies company name matches before browsing employees |
-| **Contact filtering** | Blocks students, interns, freelancers, unemployed |
-| **Duplicate detection** | SQLite DB prevents re-messaging the same person |
+| **Per-company limit** | Caps successful outreach per company (`MAX_MESSAGES_PER_COMPANY`) — the bot builds a larger candidate pool and only counts successful sends toward the per-company cap |
+| **Human-like delays & behaviour** | 45–120s between sends, randomized pauses, mouse movement and profile-dwell simulation, increased scrolls on people pages |
+| **Geo filtering** | Prefers Canadian/North American contacts (configurable) |
+| **Company verification & people-page first** | Verifies company match before browsing `/people/` and falls back to People search when needed |
+| **Search network filter** | People search includes 1st/2nd/3rd degree results so already-connected contacts are included (and messaged via DM if unmessaged)
+| **Contact filtering** | Blocks students, interns, freelancers, unemployed; hard-filters senior/lead/manager roles by default |
+| **Anti-detection** | Randomly skips a small percentage (~12%) of companies per run to break exhaustive patterns |
+| **Duplicate detection** | SQLite DB prevents re-messaging the same person; already-messaged people are skipped |
 | **Template rotation** | 5 different message templates, matched to job type |
+| **Relevance scoring** | Job cards are scored and top-N selection is used so outreach prioritizes higher-quality openings |
 
 ---
 
