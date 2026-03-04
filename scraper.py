@@ -56,12 +56,17 @@ _TITLE_JUNK_PATTERNS = [
 ]
 
 
-def build_search_url(keyword: str, start: int = 0) -> str:
+def build_search_url(
+    keyword: str,
+    start: int = 0,
+    location: str | None = None,
+    remote_filter: list[str] | None = None,
+) -> str:
     """Build a LinkedIn Jobs search URL with all configured filters."""
     params: dict[str, str] = {
         "keywords": keyword,
-        "location": Config.JOB_LOCATION,
-        "f_TPR": "r86400",  # posted in last 24 hours
+        "location": location or Config.JOB_LOCATION,
+        "f_TPR": getattr(Config, 'JOB_POSTED_WITHIN', 'r86400'),
     }
 
     if start > 0:
@@ -76,9 +81,10 @@ def build_search_url(keyword: str, start: int = 0) -> str:
     if exp_codes:
         params["f_E"] = ",".join(exp_codes)
 
-    # Remote filter
+    # Remote filter (per-location override or global default)
+    filters = remote_filter if remote_filter is not None else Config.REMOTE_FILTER
     remote_codes = [
-        REMOTE_MAP[r] for r in Config.REMOTE_FILTER if r in REMOTE_MAP
+        REMOTE_MAP[r] for r in filters if r in REMOTE_MAP
     ]
     if remote_codes:
         params["f_WT"] = ",".join(remote_codes)
@@ -86,26 +92,37 @@ def build_search_url(keyword: str, start: int = 0) -> str:
     return "https://www.linkedin.com/jobs/search/?" + urllib.parse.urlencode(params)
 
 
-MAX_PAGES = 3  # up to 3 pages per keyword for broader coverage
+MAX_PAGES = 5  # up to 5 pages per keyword×location — scrape everything possible
 
 
 def scrape_jobs(driver: webdriver.Chrome, db: Database) -> list[Job]:
     """
-    Scrape job listings for every configured keyword.
+    Scrape job listings for every configured keyword across all locations.
     Uses URL-based pagination (start=0, 25, 50 …) to walk through pages.
     On each page, scrolls the left panel to load all visible cards.
     """
     all_new_jobs: list[Job] = []
 
-    for keyword in Config.JOB_KEYWORDS:
-        logger.info(f"🔍 Searching: {keyword}")
+    # Multi-location search: each keyword × location combination
+    search_locations = getattr(Config, 'JOB_SEARCH_LOCATIONS', None)
+    if not search_locations:
+        search_locations = [(Config.JOB_LOCATION, Config.REMOTE_FILTER)]
+
+    search_combos = [
+        (kw, loc, filters)
+        for kw in Config.JOB_KEYWORDS
+        for loc, filters in search_locations
+    ]
+
+    for keyword, search_location, remote_filters in search_combos:
+        logger.info(f"🔍 Searching: {keyword} in {search_location}")
         keyword_new = 0
         keyword_dupes = 0
         empty_pages = 0  # consecutive pages with 0 cards
 
         for page_num in range(MAX_PAGES):
             offset = page_num * 25
-            url = build_search_url(keyword, start=offset)
+            url = build_search_url(keyword, start=offset, location=search_location, remote_filter=remote_filters)
             try:
                 driver.get(url)
             except WebDriverException as exc:
@@ -118,7 +135,7 @@ def scrape_jobs(driver: webdriver.Chrome, db: Database) -> list[Job]:
             if not cards:
                 empty_pages += 1
                 if page_num == 0:
-                    logger.warning(f"  No cards found for '{keyword}'")
+                    logger.warning(f"  No cards found for '{keyword}' in {search_location}")
                     _save_debug_snapshot(driver)
                 if empty_pages >= 2:
                     break  # two empty pages in a row → done
@@ -173,13 +190,104 @@ def scrape_jobs(driver: webdriver.Chrome, db: Database) -> list[Job]:
             )
 
         logger.info(
-            f"  ✅ {keyword_new} new, {keyword_dupes} dupes for '{keyword}'"
+            f"  ✅ {keyword_new} new, {keyword_dupes} dupes for '{keyword}' in {search_location}"
         )
 
     logger.info(f"📦 Total jobs scraped across all keywords: {len(all_new_jobs)}")
 
     if not all_new_jobs:
         return all_new_jobs
+
+    # ── Hard-filter: drop junk companies ──────────────────────────
+    # Only block gig platforms, data labeling, freelance marketplaces,
+    # and pure staffing/temp middlemen. Real IT companies (even body
+    # shops like Infosys/Cognizant/CGI) are kept — they hire FTEs
+    # and a referral there is still a real job.
+    _COMPANY_BLACKLIST = {
+        # ── Data labeling / AI training gig platforms ────────────
+        "alignerr", "labelbox", "outlier", "remotasks", "appen",
+        "scale ai", "telus international", "telus digital",
+        "dataannotation", "data annotation", "surge ai", "sama",
+        "clickworker", "lionsbridge", "lionbridge",
+        "welocalize", "transperfect", "defined.ai", "defined ai",
+        "superhuman", "invisible technologies", "samasource",
+        "cloudfactory", "mighty ai", "playment", "snorkel ai",
+        "prolific", "toloka", "hive micro",
+        "mercor",                           # AI training gig mill
+        "peroptyx",                         # same — task-based AI gig
+
+        # ── Freelance / contractor marketplace platforms ─────────
+        "crossover", "toptal", "upwork", "fiverr", "freelancer.com",
+        "guru.com", "turing", "andela", "revelo", "proxify",
+        "arc.dev", "gun.io", "lemon.io", "braintrust",
+        "working not working", "flexiple", "x-team", "micro1",
+        "gigster",                          # freelance dev marketplace
+        "codementor",                       # freelance dev marketplace
+        "peopleperhour",                    # freelance marketplace
+        "hubstaff talent",                  # freelance marketplace
+
+        # ── Predatory training / contract-trap firms ─────────────
+        # These lock new grads into 2-year contracts with $30-36k
+        # penalties.  A "referral" here is a trap, not a job.
+        "revature",
+        "smoothstack",
+        "fdm group", "fdm ",                # serfdom-like contracting
+        "talent path",
+        "cogent infotech",
+        "mthree", "wiley edge",            # same model — train + 2yr lock-in
+        "genspark",                         # Revature clone, Reddit warnings
+        "htd talent",                       # train-and-place contract trap
+
+        # ── Pure staffing / temp middlemen ───────────────────────
+        # Referrals to these don't help — you want the end client.
+        "robert half", "randstad", "adecco", "manpower", "experis",
+        "kelly services", "kelly science",
+        "hays recruitment", "aerotek",
+        "actalent",                         # Aerotek rebrand
+        "insight global", "aston carter",
+        "teksystems", "tek systems", "kforce",
+        "collabera", "apex systems",
+        "beacon hill staffing", "beacon hill",
+        "mondo", "cybercoders", "jobot",
+        "judge group", "mitchell martin",
+        "motion recruitment", "yoh services", "yoh,",
+        "mason frank", "nigel frank",
+        "frank recruitment", "jefferson frank",  # same family
+        "harvey nash", "tenth revolution",
+        "altis hr", "appleone", "tds personnel",
+        "staffworks", "express employment",
+        "brooksource", "metasource",        # Eight Eleven Group family
+        "calculated hire", "eight eleven",
+        "robert walters",
+        "creative circle",
+        "vmr consultants",
+        "mindtek",
+        "akkodis", "modis",                 # Adecco IT staffing rebrand
+        "pyramid consulting",               # rampant complaints
+        "market street talent",
+        "apc workforce", "zerochaos",        # bait-and-switch tactics
+        "procom",                           # Canadian IT staffing
+        "s.i. systems", "si systems",       # Canadian IT staffing
+        "tundra technical",                 # Canadian IT staffing
+        "thompson trembley",                # Canadian staffing
+
+        # ── Generic keyword patterns (catch-all for agencies) ────
+        "staffing agency", "recruiting agency", "recruitment agency",
+        "talent solutions", "workforce solutions",
+        "temp agency", "temporary staffing",
+        "contract staffing", "placement agency",
+    }
+    pre_company = len(all_new_jobs)
+    all_new_jobs = [
+        job for job in all_new_jobs
+        if not any(blk in job.company.lower() for blk in _COMPANY_BLACKLIST)
+    ]
+    filtered_company = pre_company - len(all_new_jobs)
+    if filtered_company:
+        logger.info(
+            f"🚫 Filtered out {filtered_company} junk companies "
+            f"(staffing/gig/outsourcing/body shops)"
+        )
 
     # ── Hard-filter: drop senior / lead / staff titles ────────────
     _SENIORITY_BLACKLIST = {
@@ -207,36 +315,29 @@ def scrape_jobs(driver: webdriver.Chrome, db: Database) -> list[Job]:
         eligible = all_new_jobs  # fallback so we don't return nothing
 
     # ── Rank by relevance ────────────────────────────────────────
-    # Many companies yield 0 reachable contacts, so we need ~2×
-    # the number of companies to actually hit the daily target.
-    # Formula: (daily_target / per_company) * 2, but never fewer
-    # than all eligible jobs (no point throwing away good ones).
+    # Use ALL eligible jobs — no cap.  Many companies yield zero
+    # reachable contacts, so the more we feed the messenger the
+    # better our chances of hitting the daily target.
     scored = [
         (_score_job_relevance(job, Config.JOB_KEYWORDS), job)
         for job in eligible
     ]
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    needed_companies = max(
-        20,
-        (Config.MAX_MESSAGES_PER_DAY // Config.MAX_MESSAGES_PER_COMPANY) * 2,
-    )
-    top_n = min(needed_companies, len(scored))
-    selected = [job for _, job in scored[:top_n]]
+    selected = [job for _, job in scored]
 
-    logger.info(f"🏆 Top {top_n} jobs selected by relevance:")
-    for i, (score, job) in enumerate(scored[:top_n], 1):
+    logger.info(f"🏆 {len(selected)} jobs selected by relevance (all eligible):")
+    # Log top 30 for readability, rest are still used
+    for i, (score, job) in enumerate(scored[:30], 1):
         logger.info(
             f"  {i:>2}. [{score:+.1f}] {job.title}  @  {job.company}"
             f"  ({job.location})"
         )
+    if len(scored) > 30:
+        logger.info(f"  … and {len(scored) - 30} more")
 
-    if len(scored) > top_n:
-        skipped = len(scored) - top_n
-        logger.info(f"  … {skipped} lower-relevance jobs skipped")
-
-    # Shuffle the selected set so outreach order isn't predictable
-    random.shuffle(selected)
+    # Process in strict relevance order — every message counts with
+    # a 200/week budget, so best-fit positions go first.
     return selected
 
 

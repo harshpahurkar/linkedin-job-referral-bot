@@ -101,9 +101,10 @@ def find_and_message_employees(
         if not company or company == "Unknown" or company in companies_processed:
             continue
 
-        # ── Anti-detection: skip ~12% of companies randomly ─────────
+        # ── Anti-detection: skip ~5% of companies randomly ──────────
         # Breaks the exhaustive crawl pattern that bots exhibit.
-        if random.random() < 0.12:
+        # Kept low (5%) because natural skipping already happens often.
+        if random.random() < 0.05:
             logger.info(f"  ⏭ Randomly skipping {company} (anti-pattern)")
             continue
 
@@ -185,67 +186,170 @@ def find_and_message_employees(
 _msg_counter = 0  # fallback rotation counter
 
 
+# ── JD-aware tech extraction ─────────────────────────────────────────
+# Technologies Harsh actually knows, categorised by domain.
+# Only skills in this map will appear in messages — no hallucinating.
+_MY_SKILLS: dict[str, dict[str, str]] = {
+    "languages": {
+        "java": "Java", "python": "Python", "javascript": "JavaScript",
+        "typescript": "TypeScript", "sql": "SQL",
+    },
+    "frameworks": {
+        "react": "React", "spring boot": "Spring Boot", "spring": "Spring",
+        "node.js": "Node.js", "express": "Express",
+        "django": "Django", "flask": "Flask", "angular": "Angular",
+        "next.js": "Next.js", "vue": "Vue",
+    },
+    "cloud_devops": {
+        "aws": "AWS", "azure": "Azure", "docker": "Docker",
+        "kubernetes": "Kubernetes", "k8s": "Kubernetes",
+        "terraform": "Terraform", "ci/cd": "CI/CD",
+        "jenkins": "Jenkins",
+    },
+    "data": {
+        "postgresql": "PostgreSQL", "postgres": "PostgreSQL",
+        "mongodb": "MongoDB", "mysql": "MySQL",
+        "redis": "Redis", "kafka": "Kafka",
+    },
+    "practices": {
+        "microservices": "microservices", "rest api": "REST APIs",
+        "restful": "REST APIs", "selenium": "Selenium",
+    },
+}
+
+
+def _extract_tech_from_jd(job: Job) -> str:
+    """Build a short tech-stack snippet from the JD matching Harsh's skills.
+
+    Returns e.g. "Python, React, and AWS".  Used in JD-aware templates
+    so every message feels tailored to the posting.  Falls back to a
+    generic snippet when the JD has no recognisable tech.
+    """
+    text = f"{job.description} {job.title}".lower()
+
+    # Gather matches per category (deduplicate display names)
+    found: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for category, techs in _MY_SKILLS.items():
+        for keyword, display in techs.items():
+            if keyword in text and display not in seen:
+                found.setdefault(category, []).append(display)
+                seen.add(display)
+
+    # Pick one from each category for diversity, up to 3
+    picked: list[str] = []
+    for cat in ("languages", "frameworks", "cloud_devops", "data", "practices"):
+        options = found.get(cat, [])
+        if options and len(picked) < 3:
+            picked.append(random.choice(options))
+
+    # Pad from remaining matches if we found fewer than 2
+    if len(picked) < 2:
+        remaining = [d for opts in found.values() for d in opts if d not in picked]
+        random.shuffle(remaining)
+        for d in remaining:
+            if d not in picked:
+                picked.append(d)
+            if len(picked) >= 3:
+                break
+
+    if not picked:
+        return random.choice([
+            "Java, Python, and cloud tools",
+            "Python, React, and AWS",
+            "Java, Spring Boot, and microservices",
+            "Python, Docker, and CI/CD",
+        ])
+
+    if len(picked) == 1:
+        return picked[0]
+    if len(picked) == 2:
+        return f"{picked[0]} and {picked[1]}"
+    return f"{picked[0]}, {picked[1]}, and {picked[2]}"
+
+
+# ── Template pool indices for job-title matching ─────────────────────
+# T0–T4 = originals (hardcoded tech), T5–T6 = JD-aware, T7 = recruiter.
+# T2 = school alum.
+_SCHOOL_IDX    = 2
+_RECRUITER_IDX = 7
+_FULLSTACK_POOL = [0, 5, 6]
+_BACKEND_POOL   = [1, 5, 6]
+_CLOUD_POOL     = [3, 5, 6]
+_QA_POOL        = [0, 5, 6]
+_GENERAL_POOL   = [4, 5, 6]
+
+
 def _pick_message(contact: Contact, job: Job) -> str:
     """
     Select and format the best message template for this contact + job.
-    Strategy:
-      1. If contact looks like a school alum → use the school template (#3)
-      2. Otherwise, match the template angle to the JOB TITLE:
-         - Full-stack / frontend / react roles → T1 (gov + full-stack)
-         - Backend / microservices / API roles → T2 (microservices + CI/CD)
-         - Cloud / DevOps / infra / platform / SRE roles → T4 (cloud breadth)
-         - Automation / QA / SDET / testing roles → T1 (gov automation)
-         - Anything else → T5 (short + punchy, covers everything)
-      3. If no keyword matches, rotate through non-school templates
+
+    Strategy (in priority order):
+      1. School alum  → T2 (shared-school hook)
+      2. Recruiter / talent contact → T12 (recruiter-specific)
+      3. Job-title keyword match → rotate through a pool of original
+         + JD-aware templates so LinkedIn never sees the same
+         message twice in a row.
+      4. Fallback → rotate through the general pool.
+
+    JD-aware templates (T5–T12) include a {tech_snippet} placeholder
+    that gets filled with technologies extracted from the actual job
+    description, making every message feel tailored to the posting.
+
     All messages are capped at 300 chars (LinkedIn's hard limit).
     """
     global _msg_counter
 
     templates = Config.REFERRAL_TEMPLATES
-    school_template_idx = 2  # the "fellow alum" template
 
-    # Check if contact's profile hints at shared school
+    # ── 1. School alum check ─────────────────────────────────────
     contact_text = f"{contact.title} {contact.name}".lower()
     is_alum = Config.YOUR_SCHOOL and Config.YOUR_SCHOOL.lower() in contact_text
 
-    if is_alum and school_template_idx < len(templates):
-        template = templates[school_template_idx]
-    else:
-        # Match template to job description keywords
-        jt = job.title.lower()
+    if is_alum and _SCHOOL_IDX < len(templates):
+        template = templates[_SCHOOL_IDX]
 
-        # T1 (idx 0) — Gov + full-stack: full-stack, frontend, react, angular
-        # T2 (idx 1) — Microservices + CI/CD: backend, api, microservice, java, spring
-        # T3 (idx 2) — School alum (handled above)
-        # T4 (idx 3) — Cloud breadth: cloud, devops, infra, platform, sre, kubernetes
-        # T5 (idx 4) — Short punchy: default / catch-all
+    # ── 2. Recruiter / talent contact ────────────────────────────
+    elif any(kw in (contact.title or "").lower() for kw in _RECRUITER_KEYWORDS):
+        if _RECRUITER_IDX < len(templates):
+            template = templates[_RECRUITER_IDX]
+        else:
+            template = templates[4]  # safe fallback
+
+    # ── 3. Match job title → template pool ───────────────────────
+    else:
+        jt = job.title.lower()
 
         if any(kw in jt for kw in [
             "full-stack", "full stack", "fullstack", "frontend",
             "front-end", "front end", "react", "angular", "vue",
         ]):
-            template = templates[0]  # T1 — gov + full-stack apps
+            pool = _FULLSTACK_POOL
         elif any(kw in jt for kw in [
             "backend", "back-end", "back end", "microservice",
             "api", "java", "spring", "node", "express",
         ]):
-            template = templates[1]  # T2 — microservices + CI/CD
+            pool = _BACKEND_POOL
         elif any(kw in jt for kw in [
             "cloud", "devops", "dev ops", "infrastructure", "infra",
             "platform", "sre", "site reliability", "kubernetes",
             "aws", "azure", "gcp",
         ]):
-            template = templates[3]  # T4 — cloud breadth
+            pool = _CLOUD_POOL
         elif any(kw in jt for kw in [
             "automation", "qa", "quality", "sdet", "test",
             "selenium", "cypress",
         ]):
-            template = templates[0]  # T1 — gov automation angle
+            pool = _QA_POOL
         else:
-            # No clear match — use the short punchy one or rotate
-            non_school = [t for i, t in enumerate(templates) if i != school_template_idx]
-            template = non_school[_msg_counter % len(non_school)]
-            _msg_counter += 1
+            pool = _GENERAL_POOL
+
+        valid_pool = [i for i in pool if i < len(templates)]
+        template = templates[valid_pool[_msg_counter % len(valid_pool)]]
+        _msg_counter += 1
+
+    # ── Build the tech snippet from the JD ───────────────────────
+    tech_snippet = _extract_tech_from_jd(job)
 
     # Truncate job title if it's too long (to keep msg under 300 chars)
     job_title = job.title
@@ -263,6 +367,7 @@ def _pick_message(contact: Contact, job: Job) -> str:
         company=job.company,
         your_name=Config.YOUR_NAME,
         school=Config.YOUR_SCHOOL,
+        tech_snippet=tech_snippet,
     )
 
     # Hard cap at 300 characters
@@ -271,7 +376,7 @@ def _pick_message(contact: Contact, job: Job) -> str:
 
     logger.debug(
         f"  📝 Message for {contact.name}: role='{job_title}' "
-        f"company='{job.company}' [{len(msg)} chars]"
+        f"company='{job.company}' tech='{tech_snippet}' [{len(msg)} chars]"
     )
     return msg
 
@@ -427,6 +532,30 @@ def _is_north_american_location(location: str) -> bool:
     return any(kw in loc for kw in _NA_LOCATION_KEYWORDS)
 
 
+def _is_remote_or_us_job(job: Job | None) -> bool:
+    """Check if a job is US-based or a remote role with no clear Canadian location.
+
+    For these jobs, we accept North American contacts rather than
+    filtering strictly for Canadian ones.
+    """
+    if not job:
+        return False
+    loc = job.location.lower()
+    # Clearly US-based
+    if "united states" in loc or ", us" in loc:
+        return True
+    # US city names in location
+    _US_CITIES = ["new york", "san francisco", "seattle", "austin", "chicago",
+                  "boston", "los angeles", "denver", "atlanta", "dallas",
+                  "washington", "portland", "philadelphia", "miami"]
+    if any(city in loc for city in _US_CITIES):
+        return True
+    # "Remote" without any Canadian indicator → likely US remote
+    if "remote" in loc and not _is_canadian_location(loc):
+        return True
+    return False
+
+
 def _company_name_matches(expected: str, found: str) -> bool:
     """
     Check if a found company name is a reasonable match for the expected one.
@@ -452,7 +581,7 @@ def _browse_company_people_page(
     driver: webdriver.Chrome,
     db: Database,
     company: str,
-    max_results: int = 8,
+    max_results: int = 15,
     job: Job | None = None,
 ) -> list[Contact]:
     """
@@ -519,15 +648,17 @@ def _browse_company_people_page(
 
         # ── Go to /people/ tab with geo filter ──────────────────────
         # LinkedIn /people/ page supports keyword filtering.
-        # Add "Canada" as a keyword filter to get local employees.
+        # Add "Canada" keyword for Canadian jobs; skip for US remote roles.
         people_url = company_url.rstrip("/") + "/people/"
         job_location = (job.location if job else "").strip()
-        if _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower():
+        if not _is_remote_or_us_job(job) and (
+            _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
+        ):
             people_url += "?keywords=Canada"
 
         driver.get(people_url)
         human_delay(1, 1.5)
-        scroll_page(driver, scrolls=6)
+        scroll_page(driver, scrolls=10)
 
         # Extract ALL people using JS — artdeco-entity-lockup with /in/ links
         # Also grab location (caption element) for geo filtering
@@ -621,7 +752,7 @@ def _browse_company_people_page(
 def _search_company_employees(
     driver: webdriver.Chrome,
     company: str,
-    max_results: int = 20,
+    max_results: int = 30,
     job: Job | None = None,
 ) -> list[Contact]:
     """
@@ -629,10 +760,12 @@ def _search_company_employees(
     Returns up to `max_results` contacts.
     Includes 1st-degree connections so we can DM already-connected people.
     """
-    # Add "Canada" to keywords so results favour local employees
+    # Add "Canada" to keywords for Canadian jobs; skip for US remote roles
     geo_keyword = ""
     job_location = (job.location if job else "").strip()
-    if _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower():
+    if not _is_remote_or_us_job(job) and (
+        _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
+    ):
         geo_keyword = "%20Canada"
 
     search_url = (
@@ -646,7 +779,7 @@ def _search_company_employees(
     try:
         driver.get(search_url)
         human_delay(1, 1.5)
-        scroll_page(driver, scrolls=4)
+        scroll_page(driver, scrolls=8)
     except WebDriverException as e:
         logger.debug(f"Browser error navigating to people search: {e}")
         return []
