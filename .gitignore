@@ -1,10 +1,16 @@
 # Environment & secrets
 .env
 
-# Database and logs
+# Database, logs, and debug outputs
 data/*.db
 data/logs/
 data/debug_page.html
+data/debug_page.png
+data/login_failure.html
+data/login_failure.png
+data/*.txt
+data/*.json
+data/*.png
 
 # Chrome profile and browser data
 Chrome Bot Data/

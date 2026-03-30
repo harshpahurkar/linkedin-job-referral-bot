@@ -5,6 +5,9 @@ and sends referral request messages.
 
 import hashlib
 import random
+import re
+import urllib.parse
+from pathlib import Path
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -23,6 +26,11 @@ from models import Job, Contact, Database
 from utils import (
     get_logger, human_delay, long_delay, scroll_page,
     human_move_and_click, simulate_random_mouse_movement,
+)
+from antidetect import (
+    get_session, is_session_safe, check_for_linkedin_warnings,
+    smart_delay, should_take_break, simulate_natural_break,
+    realistic_profile_reading, realistic_typing, safe_get,
 )
 
 logger = get_logger("messenger")
@@ -78,9 +86,10 @@ def find_and_message_employees(
         return 0
     if weekly_profiles >= Config.MAX_PROFILE_VIEWS_PER_WEEK:
         logger.warning(
-            f"🛑 Weekly profile-view limit approaching "
+            f"🛑 Weekly profile-view limit reached "
             f"({weekly_profiles}/{Config.MAX_PROFILE_VIEWS_PER_WEEK}). "
-            f"Skipping outreach to protect your account."
+                f"Skipping outreach to protect your account. "
+                f"Wait for the 7-day window to roll over or clear old weekly_activity rows."
         )
         return 0
 
@@ -94,8 +103,20 @@ def find_and_message_employees(
             logger.info(f"🛑 Daily message limit reached ({Config.MAX_MESSAGES_PER_DAY}).")
             break
         if (weekly_connections + connections_today) >= Config.MAX_CONNECTIONS_PER_WEEK:
-            logger.info("🛑 Would exceed weekly connection limit. Stopping.")
+            logger.info("🛑 Weekly connection limit reached. Stopping.")
             break
+
+        # ── Anti-detection: session safety check ─────────────────
+        if not is_session_safe():
+            logger.critical("🛑 LinkedIn warning detected — stopping outreach immediately!")
+            break
+
+        # ── Anti-detection: micro-break every N actions ──────────
+        if should_take_break():
+            simulate_natural_break(driver)
+            if not is_session_safe():
+                logger.critical("🛑 Warning detected during break — aborting!")
+                break
 
         company = job.company.strip()
         if not company or company == "Unknown" or company in companies_processed:
@@ -127,6 +148,8 @@ def find_and_message_employees(
         contacts.sort(key=_score_contact, reverse=True)
 
         sent_at_company = 0
+        consecutive_failures = 0
+        _MAX_CONSECUTIVE_FAILURES = 3
         for contact in contacts:
             if total_sent >= Config.MAX_MESSAGES_PER_DAY:
                 break
@@ -134,6 +157,9 @@ def find_and_message_employees(
                 break
             if sent_at_company >= Config.MAX_MESSAGES_PER_COMPANY:
                 logger.debug(f"  → Hit per-company limit ({Config.MAX_MESSAGES_PER_COMPANY}) for {company}, moving on.")
+                break
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                logger.info(f"  → {_MAX_CONSECUTIVE_FAILURES} consecutive failures at {company}, moving on.")
                 break
 
             # Skip if already messaged
@@ -151,6 +177,24 @@ def find_and_message_employees(
             # Track profile view
             db.log_activity("profile_view", contact.profile_url)
 
+            # ── Human pattern: browse-without-acting ─────────────
+            # Real humans view some profiles and move on without
+            # connecting. A bot that connects with 100% of viewed
+            # profiles is suspicious. ~15% of the time, we just
+            # read the profile and skip (still counts as a view).
+            if random.random() < 0.15:
+                logger.info(f"  👀 Browsed {contact.name}'s profile without acting (human pattern)")
+                # Still visit the profile so it looks natural
+                try:
+                    if not safe_get(driver, contact.profile_url):
+                        continue
+                    get_session().record_profile_view()
+                    realistic_profile_reading(driver)
+                except Exception:
+                    pass
+                human_delay(1.0, 3.0)
+                continue
+
             message = _pick_message(contact, job)
 
             result = _send_connection_with_note(driver, contact, message)
@@ -160,13 +204,31 @@ def find_and_message_employees(
                 if result == "connection_sent":
                     db.log_activity("connection_request", contact.name)
                     connections_today += 1
+                    get_session().record_connection()
                 else:
                     db.log_activity("direct_message", contact.name)
+                    get_session().record_dm()
                 total_sent += 1
                 sent_at_company += 1
+                consecutive_failures = 0  # reset on success
                 logger.info(f"  ✉️  Sent referral request to {contact.name} ({company})")
-                long_delay()  # respect rate limits
+
+                # ── Anti-detection: fatigue-aware delay after send ──
+                # Uses session velocity + fatigue multiplier for
+                # realistic pacing that slows down over time.
+                smart_delay(
+                    Config.MESSAGE_DELAY_MIN,
+                    Config.MESSAGE_DELAY_MAX,
+                    action_type="connection",
+                )
+
+                # Check for warnings after each send
+                warning, _ = check_for_linkedin_warnings(driver)
+                if warning:
+                    logger.critical("🛑 Warning after send — stopping immediately!")
+                    break
             else:
+                consecutive_failures += 1
                 logger.warning(f"  ⚠️  Could not message {contact.name}")
                 human_delay(1, 2)
 
@@ -495,7 +557,7 @@ def _filter_contacts(contacts: list[Contact]) -> list[Contact]:
 
 # Canadian province / territory codes + common location strings
 _CANADA_LOCATION_KEYWORDS = [
-    "canada", ", ca",
+    "canada",
     # Provinces
     "ontario", ", on", "toronto", "ottawa", "waterloo", "kitchener",
     "mississauga", "hamilton", "london, on", "brampton", "markham",
@@ -561,20 +623,226 @@ def _company_name_matches(expected: str, found: str) -> bool:
     Check if a found company name is a reasonable match for the expected one.
     Handles cases like 'Unity' vs 'Unity Technologies' or 'IBM' vs 'IBM Canada'.
     """
-    e = expected.lower().strip()
-    f = found.lower().strip()
+    return _company_match_score(expected, found) >= 45
+
+
+def _normalize_company_name(name: str) -> str:
+    """Normalize a company name for fuzzy matching across LinkedIn variants."""
+    if not name:
+        return ""
+
+    text = name.lower().strip()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    tokens = [t for t in text.split() if t]
+
+    # Common legal suffixes / noise that hurt matching quality.
+    stopwords = {
+        "inc", "incorporated", "corp", "corporation", "co", "company",
+        "ltd", "limited", "llc", "plc", "group", "holdings", "technologies",
+        "technology", "solutions", "services", "international", "global",
+        "the", "and",
+    }
+    filtered = [t for t in tokens if t not in stopwords]
+    if filtered:
+        tokens = filtered
+
+    return " ".join(tokens)
+
+
+def _company_match_score(expected: str, found: str) -> int:
+    """Return 0-100 match score between expected company and a found candidate."""
+    e_raw = expected.lower().strip()
+    f_raw = found.lower().strip()
+    if not e_raw or not f_raw:
+        return 0
+
+    e = _normalize_company_name(expected)
+    f = _normalize_company_name(found)
+
     if not e or not f:
-        return False
-    # Exact match
+        return 0
     if e == f:
-        return True
-    # One contains the other (e.g. "Unity" in "Unity Technologies")
+        return 100
     if e in f or f in e:
-        return True
-    # First word matches for short names (e.g. "IBM" == "IBM")
-    if len(e) <= 5 and f.startswith(e):
-        return True
-    return False
+        return 82
+
+    e_tokens = e.split()
+    f_tokens = f.split()
+    e_set = set(e_tokens)
+    f_set = set(f_tokens)
+    overlap = len(e_set & f_set)
+    if overlap == 0:
+        # Short-name fallback ("ibm" vs "ibm canada")
+        if len(e) <= 5 and (f.startswith(e) or e.startswith(f)):
+            return 60
+        return 0
+
+    score = int((overlap / max(len(e_set), len(f_set))) * 100)
+    if e_tokens and f_tokens and e_tokens[0] == f_tokens[0]:
+        score += 10
+    return min(score, 95)
+
+
+def _extract_people_from_current_page(
+    driver: webdriver.Chrome,
+    source_label: str,
+) -> list[dict[str, str]]:
+    """DOM-agnostic fallback extractor for profile rows on people/search pages."""
+    try:
+        people_data = driver.execute_script(r"""
+            const out = [];
+            const seen = new Set();
+            const profilePathRe = /\/in\/[a-z0-9\-_%]+\/?$/i;
+
+            function visible(el) {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return el.offsetParent !== null && r.width > 0 && r.height > 0;
+            }
+
+            function clean(s) {
+                return (s || '').replace(/\s+/g, ' ').trim();
+            }
+
+            const links = document.querySelectorAll('a[href*="/in/"]');
+            for (const link of links) {
+                if (!visible(link)) continue;
+
+                const href = (link.href || '').split('?')[0].replace(/\/$/, '');
+                if (!href || seen.has(href)) continue;
+                if (!profilePathRe.test(href)) continue;
+                if (href.includes('/in/me')) continue;
+
+                let card = link.closest(
+                    '.reusable-search__result-container, .artdeco-entity-lockup, '
+                    + '.org-people-profile-card, li, article, .entity-result'
+                );
+                if (!card) {
+                    let el = link;
+                    for (let i = 0; i < 7; i++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        const txt = clean(el.innerText || '');
+                        if (txt.split('\n').length >= 2) {
+                            card = el;
+                            break;
+                        }
+                    }
+                }
+
+                const nameRaw = clean(link.innerText || link.textContent || '');
+                if (!nameRaw || nameRaw.toLowerCase() === 'linkedin member') continue;
+                if (nameRaw.length > 80) continue;
+
+                const lines = card
+                    ? (card.innerText || '').split('\n').map(clean).filter(Boolean)
+                    : [nameRaw];
+
+                const deduped = [];
+                const lineSeen = new Set();
+                for (const line of lines) {
+                    const k = line.toLowerCase();
+                    if (!lineSeen.has(k)) {
+                        lineSeen.add(k);
+                        deduped.push(line);
+                    }
+                }
+
+                let title = '';
+                let location = '';
+                for (const line of deduped) {
+                    const low = line.toLowerCase();
+                    if (low === nameRaw.toLowerCase()) continue;
+                    if (!location && (
+                        line.includes(',') ||
+                        /\b(canada|united states|remote|area|province|state)\b/i.test(low)
+                    )) {
+                        location = line;
+                        continue;
+                    }
+                    if (!title && line.length >= 3 && line.length <= 130
+                        && !/^follow$/i.test(line)
+                        && !/^connect$/i.test(line)
+                        && !/\b\d+(st|nd|rd|th)\+?\b/.test(line)) {
+                        title = line;
+                    }
+                }
+
+                out.push({
+                    name: nameRaw,
+                    title: title,
+                    location: location,
+                    link: href,
+                });
+                seen.add(href);
+
+                if (out.length >= 150) break;
+            }
+
+            return out;
+        """)
+        if people_data:
+            logger.debug(f"  {source_label}: structural fallback extracted {len(people_data)} profiles")
+            return people_data
+    except Exception as e:
+        logger.debug(f"  {source_label}: structural fallback extractor failed: {e}")
+
+    return []
+
+
+def _build_contacts_from_people_data(
+    company: str,
+    people_data: list[dict],
+    max_results: int,
+) -> list[Contact]:
+    """Convert raw extracted people dicts to Contact records."""
+    contacts: list[Contact] = []
+    seen_ids: set[str] = set()
+
+    for person in people_data:
+        name = (person.get("name") or "").strip()
+        title_text = (person.get("title") or "").strip()
+        profile_url = (person.get("link") or "").strip()
+        person_location = (person.get("location") or "").strip()
+
+        if not name or not profile_url:
+            continue
+
+        first_name = name.split()[0] if name else "there"
+        contact_id = hashlib.md5(f"{name}|{profile_url}".encode()).hexdigest()[:16]
+        if contact_id in seen_ids:
+            continue
+
+        contacts.append(Contact(
+            contact_id=contact_id,
+            name=name,
+            first_name=first_name,
+            profile_url=profile_url,
+            company=company,
+            title=title_text,
+            location=person_location,
+        ))
+        seen_ids.add(contact_id)
+
+        if len(contacts) >= max_results:
+            break
+
+    return contacts
+
+
+def _save_contact_debug_snapshot(driver: webdriver.Chrome, company: str, stage: str):
+    """Save a screenshot when contact extraction fails, for selector debugging."""
+    try:
+        safe_company = re.sub(r"[^a-zA-Z0-9_-]+", "_", company)[:40]
+        safe_stage = re.sub(r"[^a-zA-Z0-9_-]+", "_", stage)[:24]
+        debug_dir = Path(__file__).parent / "data" / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        shot_path = debug_dir / f"contacts_{safe_company}_{safe_stage}.png"
+        driver.save_screenshot(str(shot_path))
+        logger.debug(f"  Saved contact debug screenshot: {shot_path}")
+    except Exception:
+        pass
 
 
 def _browse_company_people_page(
@@ -597,8 +865,8 @@ def _browse_company_people_page(
             f"https://www.linkedin.com/search/results/companies/"
             f"?keywords={company}&origin=GLOBAL_SEARCH_HEADER"
         )
-        driver.get(search_url)
-        human_delay(1, 1.5)
+        if not safe_get(driver, search_url):
+            return contacts
         db.log_activity("profile_view", f"company_search:{company}")
 
         # ── Find the RIGHT company from search results ──────────────
@@ -621,21 +889,53 @@ def _browse_company_people_page(
                 return results;
             """)
 
+            # Fallback for newer LinkedIn DOM variants without entity-result classes.
+            if not results:
+                results = driver.execute_script("""
+                    const out = [];
+                    const seen = new Set();
+                    const links = document.querySelectorAll('a[href*="/company/"]');
+                    for (const a of links) {
+                        const href = (a.href || '').split('?')[0].replace(/\\/$/, '');
+                        if (!href || seen.has(href)) continue;
+                        const txt = (a.innerText || a.textContent || '').trim();
+                        if (!txt || txt.length > 120) continue;
+                        out.push({ url: href, name: txt });
+                        seen.add(href);
+                        if (out.length >= 20) break;
+                    }
+                    return out;
+                """)
+
             if results:
-                # Find the best-matching company
+                # Find the best-matching company by fuzzy score.
+                best_result = None
+                best_score = -1
                 for r in results:
-                    if _company_name_matches(company, r["name"]):
-                        company_url = r["url"]
-                        logger.debug(f"  ✅ Matched company: '{r['name']}' → {company_url}")
-                        break
-                if not company_url:
-                    # No good match — log and skip
-                    found_names = [r["name"] for r in results[:5]]
-                    logger.warning(
-                        f"  ⚠️  No company match for '{company}' in search results: "
-                        f"{found_names}. Skipping."
+                    score = _company_match_score(company, r.get("name", ""))
+                    if score > best_score:
+                        best_score = score
+                        best_result = r
+
+                if best_result and best_score >= 45:
+                    company_url = best_result["url"]
+                    logger.debug(
+                        f"  ✅ Matched company: '{best_result['name']}' "
+                        f"(score={best_score}) → {company_url}"
                     )
-                    return contacts
+                else:
+                    # No strong match — fall back to the top result rather than skipping.
+                    found_names = [r["name"] for r in results[:5]]
+                    if best_result:
+                        company_url = best_result["url"]
+                        logger.warning(
+                            f"  ⚠️  Weak company match for '{company}' (best score={best_score}). "
+                            f"Using '{best_result['name']}' and continuing. Candidates: {found_names}"
+                        )
+                    else:
+                        logger.warning(
+                            f"  ⚠️  No company results for '{company}'. Candidates: {found_names}"
+                        )
         except TimeoutException:
             pass
 
@@ -656,8 +956,8 @@ def _browse_company_people_page(
         ):
             people_url += "?keywords=Canada"
 
-        driver.get(people_url)
-        human_delay(1, 1.5)
+        if not safe_get(driver, people_url):
+            return contacts
         scroll_page(driver, scrolls=10)
 
         # Extract ALL people using JS — artdeco-entity-lockup with /in/ links
@@ -682,40 +982,33 @@ def _browse_company_people_page(
         """)
 
         if not people_data:
-            logger.debug(f"  No people found via JS on {company} people page")
+            logger.debug(f"  No people found via strict selector on {company} people page")
+            people_data = _extract_people_from_current_page(
+                driver,
+                source_label=f"{company} people page",
+            )
+
+        if not people_data:
+            logger.debug(f"  No people found via fallback extraction on {company} people page")
+            _save_contact_debug_snapshot(driver, company, "people_page_empty")
             return contacts
 
         logger.debug(f"  Raw people found: {len(people_data)}")
 
-        # Build all contacts first, then filter for relevant titles
-        all_contacts: list[Contact] = []
-        for person in people_data:
-            name = person.get("name", "").strip()
-            title_text = person.get("title", "").strip()
-            profile_url = person.get("link", "").strip()
-            person_location = person.get("location", "").strip()
-
-            if not name:
-                continue
-
-            first_name = name.split()[0] if name else "there"
-            contact_id = hashlib.md5(f"{name}|{profile_url}".encode()).hexdigest()[:16]
-
-            all_contacts.append(Contact(
-                contact_id=contact_id,
-                name=name,
-                first_name=first_name,
-                profile_url=profile_url,
-                company=company,
-                title=title_text,
-                location=person_location,
-            ))
+        all_contacts = _build_contacts_from_people_data(
+            company,
+            people_data,
+            max_results=max(max_results * 4, 50),
+        )
+        if not all_contacts:
+            logger.debug(f"  Could not build valid contact objects for {company}")
+            _save_contact_debug_snapshot(driver, company, "people_parse_empty")
+            return contacts
 
         # ── Geographic filtering ────────────────────────────────────
         # Prefer Canadian contacts; fall back to North American if needed
         canadian = [c for c in all_contacts if c.location and _is_canadian_location(c.location)]
         north_american = [c for c in all_contacts if c.location and _is_north_american_location(c.location)]
-        no_location = [c for c in all_contacts if not c.location]
 
         if canadian:
             geo_filtered = canadian
@@ -731,12 +1024,26 @@ def _browse_company_people_page(
         # Only keep people with relevant titles for our field
         relevant = _filter_relevant_titles(geo_filtered)
         if not relevant:
-            logger.info(f"  → {len(all_contacts)} people found but none with relevant titles in region, skipping {company}")
+            # LinkedIn occasionally hides title/location snippets on people cards.
+            # Degrade gracefully instead of dropping the company entirely.
+            fallback = _filter_contacts(geo_filtered)
+            fallback.sort(key=_score_contact, reverse=True)
+            fallback = fallback[:max_results]
+            if fallback:
+                logger.warning(
+                    f"  ⚠️  {len(all_contacts)} people found at {company} but no strict title matches; "
+                    f"using {len(fallback)} fallback contacts."
+                )
+                return fallback
+
+            logger.info(
+                f"  → {len(all_contacts)} people found but none passed title/block filters for {company}"
+            )
             return contacts
 
         # Sort by relevance — main loop caps at MAX_MESSAGES_PER_COMPANY
         relevant.sort(key=_score_contact, reverse=True)
-        contacts = relevant
+        contacts = relevant[:max_results]
 
         logger.info(
             f"  → Found {len(contacts)} relevant contacts out of {len(all_contacts)} "
@@ -761,91 +1068,114 @@ def _search_company_employees(
     Includes 1st-degree connections so we can DM already-connected people.
     """
     # Add "Canada" to keywords for Canadian jobs; skip for US remote roles
-    geo_keyword = ""
+    geo_suffix = ""
     job_location = (job.location if job else "").strip()
     if not _is_remote_or_us_job(job) and (
         _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
     ):
-        geo_keyword = "%20Canada"
+        geo_suffix = " Canada"
 
-    search_url = (
-        f"https://www.linkedin.com/search/results/people/"
-        f"?keywords={company}{geo_keyword}"
-        f"&network=%5B%22F%22%2C%22S%22%2C%22O%22%5D"
-        f"&origin=FACETED_SEARCH"
-    )
-    # network filter: F = 1st degree, S = 2nd degree, O = 3rd+
-
-    try:
-        driver.get(search_url)
-        human_delay(1, 1.5)
-        scroll_page(driver, scrolls=8)
-    except WebDriverException as e:
-        logger.debug(f"Browser error navigating to people search: {e}")
-        return []
+    keyword_query = urllib.parse.quote_plus(f"{company}{geo_suffix}")
+    search_urls = [
+        # network filter: F = 1st degree, S = 2nd degree, O = 3rd+
+        (
+            f"https://www.linkedin.com/search/results/people/"
+            f"?keywords={keyword_query}"
+            f"&network=%5B%22F%22%2C%22S%22%2C%22O%22%5D"
+            f"&origin=FACETED_SEARCH"
+        ),
+        # Fallback URL for newer search routing.
+        (
+            f"https://www.linkedin.com/search/results/people/"
+            f"?keywords={keyword_query}"
+            f"&origin=GLOBAL_SEARCH_HEADER"
+        ),
+    ]
 
     contacts: list[Contact] = []
+    people_data: list[dict] = []
 
-    try:
-        # Use JS to extract all people data at once — avoids stale element issues
-        people_data = driver.execute_script("""
-            const results = [];
-            document.querySelectorAll('.reusable-search__result-container').forEach(card => {
-                const nameEl = card.querySelector(".entity-result__title-text a span[aria-hidden='true']")
-                             || card.querySelector('.entity-result__title-text a span');
-                const linkEl = card.querySelector('.entity-result__title-text a[href*="/in/"]')
-                             || card.querySelector('a[href*="/in/"]');
-                const subtitleEl = card.querySelector('.entity-result__primary-subtitle');
-                const secondaryEl = card.querySelector('.entity-result__secondary-subtitle');
-                const summaryEl = card.querySelector('.entity-result__summary');
-                if (!nameEl) return;
-                const name = nameEl.textContent.trim();
-                if (!name || name.toLowerCase() === 'linkedin member') return;
-                let title = subtitleEl ? subtitleEl.textContent.trim() : '';
-                if (!title && summaryEl) {
-                    title = summaryEl.textContent.trim().replace(/^Current:\\s*/i, '');
-                }
-                const location = secondaryEl ? secondaryEl.textContent.trim() : '';
-                const link = linkEl ? linkEl.href.split('?')[0] : '';
-                if (link) {
-                    results.push({ name, link, title, location });
-                }
-            });
-            return results;
-        """)
+    for idx, search_url in enumerate(search_urls, start=1):
+        try:
+            if not safe_get(driver, search_url):
+                continue
+            scroll_page(driver, scrolls=8)
+        except WebDriverException as e:
+            logger.debug(f"Browser error navigating to people search (attempt {idx}): {e}")
+            continue
+
+        try:
+            # Use JS to extract all people data at once — avoids stale element issues.
+            people_data = driver.execute_script("""
+                const results = [];
+                document.querySelectorAll('.reusable-search__result-container').forEach(card => {
+                    const nameEl = card.querySelector(".entity-result__title-text a span[aria-hidden='true']")
+                                 || card.querySelector('.entity-result__title-text a span');
+                    const linkEl = card.querySelector('.entity-result__title-text a[href*="/in/"]')
+                                 || card.querySelector('a[href*="/in/"]');
+                    const subtitleEl = card.querySelector('.entity-result__primary-subtitle');
+                    const secondaryEl = card.querySelector('.entity-result__secondary-subtitle');
+                    const summaryEl = card.querySelector('.entity-result__summary');
+                    if (!nameEl) return;
+                    const name = nameEl.textContent.trim();
+                    if (!name || name.toLowerCase() === 'linkedin member') return;
+                    let title = subtitleEl ? subtitleEl.textContent.trim() : '';
+                    if (!title && summaryEl) {
+                        title = summaryEl.textContent.trim().replace(/^Current:\\s*/i, '');
+                    }
+                    const location = secondaryEl ? secondaryEl.textContent.trim() : '';
+                    const link = linkEl ? linkEl.href.split('?')[0] : '';
+                    if (link) {
+                        results.push({ name, link, title, location });
+                    }
+                });
+                return results;
+            """)
+        except Exception:
+            people_data = []
 
         if not people_data:
-            logger.debug(f"  Search fallback: no results found for {company}")
-            return contacts
+            people_data = _extract_people_from_current_page(
+                driver,
+                source_label=f"people search attempt {idx}",
+            )
 
-        logger.debug(f"  Search fallback: {len(people_data)} people found for {company}")
+        if people_data:
+            logger.debug(
+                f"  Search attempt {idx}: extracted {len(people_data)} profiles for {company}"
+            )
+            break
 
-        for person in people_data[:max_results]:
-            name = person.get("name", "").strip()
-            profile_url = person.get("link", "").strip()
-            title_text = person.get("title", "").strip()
-            location = person.get("location", "").strip()
+    if not people_data:
+        logger.debug(f"  Search fallback: no results found for {company}")
+        _save_contact_debug_snapshot(driver, company, "people_search_empty")
+        return contacts
 
-            if not name or not profile_url:
-                continue
+    logger.debug(f"  Search fallback: {len(people_data)} people found for {company}")
 
-            first_name = name.split()[0] if name else "there"
-            contact_id = hashlib.md5(f"{name}|{profile_url}".encode()).hexdigest()[:16]
+    contacts = _build_contacts_from_people_data(
+        company,
+        people_data,
+        max_results=max(max_results * 3, 40),
+    )
 
-            contacts.append(Contact(
-                contact_id=contact_id,
-                name=name,
-                first_name=first_name,
-                profile_url=profile_url,
-                company=company,
-                title=title_text,
-                location=location,
-            ))
+    if not contacts:
+        logger.debug(f"  Search fallback: extracted rows but no valid contacts for {company}")
+        return contacts
 
-    except WebDriverException as e:
-        logger.debug(f"Browser error during people search for {company}: {e}")
-    except Exception as e:
-        logger.debug(f"Error parsing people search results: {e}")
+    # Prefer relevant roles, but gracefully keep fallback contacts when title snippets are missing.
+    relevant = _filter_relevant_titles(contacts)
+    if relevant:
+        relevant.sort(key=_score_contact, reverse=True)
+        return relevant[:max_results]
+
+    contacts = _filter_contacts(contacts)
+    contacts.sort(key=_score_contact, reverse=True)
+    logger.warning(
+        f"  ⚠️  Search found contacts for {company} but no strict relevant-title matches; "
+        f"using {min(len(contacts), max_results)} fallback contacts."
+    )
+    return contacts[:max_results]
 
     return contacts
 
@@ -861,13 +1191,14 @@ def _send_connection_with_note(
     Returns: 'connection_sent', 'dm_sent', or 'failed'.
     """
     try:
-        driver.get(contact.profile_url)
-        human_delay(1, 2)
+        if not safe_get(driver, contact.profile_url):
+            return "failed"
 
-        # ── Anti-detection: profile dwell time ─────────────────────
-        # Simulate reading the profile before taking action.
-        # A real human scrolls around, moves their mouse, pauses.
-        _simulate_profile_reading(driver)
+        # ── Anti-detection: realistic profile reading ─────────────
+        # Uses content-scaled timing, Bézier mouse, scroll-back patterns
+        get_session().record_profile_view()
+        realistic_profile_reading(driver)
+
         status = _get_connection_status(driver)
         logger.debug(
             f"  Profile {contact.name}: connection status = '{status}', "
@@ -999,21 +1330,11 @@ def _send_direct_message(
             _close_msg_overlay(driver)
             return False
 
-        # Focus and type the message character by character
+        # Focus and type the message with realistic human patterns
         msg_input.click()
         human_delay(0.3, 0.5)
 
-        for char in message[:300]:
-            if ord(char) > 0xFFFF:
-                driver.execute_script(
-                    "arguments[0].textContent += arguments[1];"
-                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));",
-                    msg_input, char,
-                )
-                time.sleep(random.uniform(0.05, 0.12))
-            else:
-                msg_input.send_keys(char)
-                time.sleep(random.uniform(0.02, 0.08))
+        realistic_typing(msg_input, message[:300])
 
         human_delay(0.5, 1)
 
@@ -1376,58 +1697,22 @@ def _click_send_button(driver: webdriver.Chrome) -> bool:
 def _type_message(element, text: str):
     """Type a message character by character (human-like).
     
-    ChromeDriver's send_keys() crashes on non-BMP characters (emojis like 🙏🥀👋).
-    Strategy: type normal chars one-by-one for human feel, inject emojis via JS.
+    Delegates to antidetect.realistic_typing which adds:
+      - Variable per-character speed based on key position
+      - Thinking pauses between words
+      - Rare typo + backspace correction
+      - Session fatigue scaling
     """
-    import random, time
-
-    buffer = ""
-    for char in text:
-        # Check if character is outside the Basic Multilingual Plane (BMP)
-        if ord(char) > 0xFFFF:
-            # First, flush any buffered normal chars
-            if buffer:
-                for c in buffer:
-                    element.send_keys(c)
-                    time.sleep(random.uniform(0.02, 0.08))
-                buffer = ""
-            # Inject the non-BMP char via JavaScript
-            element.parent.execute_script(
-                "arguments[0].value += arguments[1]; "
-                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                element, char
-            )
-            time.sleep(random.uniform(0.05, 0.12))
-        else:
-            element.send_keys(char)
-            time.sleep(random.uniform(0.02, 0.08))
+    realistic_typing(element, text)
 
 
 def _simulate_profile_reading(driver: webdriver.Chrome):
     """Simulate a human reading a LinkedIn profile before taking action.
 
-    Real humans don't land on a page and immediately click Connect.
-    They scroll around, move their mouse, maybe read the About section.
-    This adds 3–7 seconds of natural-looking activity.
+    Delegates to antidetect.realistic_profile_reading which uses:
+      - Content-length-scaled reading time
+      - Bézier curve mouse movements
+      - Multiple scroll-stop-read cycles
+      - Occasional scroll-back (re-reading)
     """
-    import time
-
-    # Move mouse to a random spot (like reading the headline)
-    simulate_random_mouse_movement(driver)
-
-    # Scroll down a bit to "read" the profile (random distance)
-    scroll_dist = random.randint(200, 500)
-    driver.execute_script(f"window.scrollBy(0, {scroll_dist});")
-    human_delay(1.0, 2.5)
-
-    # Move mouse again (like reading a section)
-    simulate_random_mouse_movement(driver)
-
-    # Maybe scroll down a bit more (60% chance)
-    if random.random() < 0.60:
-        driver.execute_script(f"window.scrollBy(0, {random.randint(100, 350)});")
-        human_delay(0.5, 1.5)
-
-    # Scroll back up to the top (where Connect button lives)
-    driver.execute_script("window.scrollTo(0, 0);")
-    human_delay(0.3, 0.7)
+    realistic_profile_reading(driver)

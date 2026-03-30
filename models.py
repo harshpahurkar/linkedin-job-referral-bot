@@ -2,6 +2,7 @@
 Data models for jobs, companies, and contacts — stored in SQLite.
 """
 
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,6 +47,8 @@ class Database:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self._init_tables()
+        self._set_db_permissions()
+        self._purge_old_activity()
 
     # ── Schema ────────────────────────────────────────────────────────
     def _init_tables(self):
@@ -89,6 +92,20 @@ class Database:
                 action_date     TEXT,
                 detail          TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS hiring_posts (
+                post_id         TEXT PRIMARY KEY,
+                poster_name     TEXT,
+                poster_title    TEXT,
+                poster_url      TEXT,
+                company         TEXT,
+                post_text       TEXT,
+                post_url        TEXT,
+                score           INTEGER DEFAULT 0,
+                action_taken    TEXT DEFAULT '',
+                date_found      TEXT,
+                engaged         INTEGER DEFAULT 0
+            );
             """
         )
         self.conn.commit()
@@ -106,6 +123,24 @@ class Database:
                 "ALTER TABLE contacts ADD COLUMN location TEXT DEFAULT ''"
             )
             self.conn.commit()
+
+    def _set_db_permissions(self):
+        """Restrict DB file to owner-only access (Windows: remove inheritance)."""
+        try:
+            db_file = Path(self.db_path)
+            if db_file.exists():
+                # Owner read/write only (0o600)
+                os.chmod(str(db_file), 0o600)
+        except OSError:
+            pass  # may fail on some Windows configs — non-critical
+
+    def _purge_old_activity(self, days: int = 90):
+        """Delete weekly_activity records older than `days` to limit PII retention."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self.conn.execute(
+            "DELETE FROM weekly_activity WHERE action_date < ?", (cutoff,)
+        )
+        self.conn.commit()
 
     # ── Jobs ──────────────────────────────────────────────────────────
     def clear_jobs(self):
@@ -220,6 +255,57 @@ class Database:
 
     def weekly_connections_sent(self) -> int:
         return self.get_weekly_count("connection_request")
+
+    # ── Hiring Posts ─────────────────────────────────────────────────
+    def insert_hiring_post(self, post_id: str, poster_name: str,
+                           poster_title: str, poster_url: str,
+                           company: str, post_text: str, post_url: str,
+                           score: int) -> bool:
+        try:
+            self.conn.execute(
+                """INSERT INTO hiring_posts
+                   (post_id, poster_name, poster_title, poster_url,
+                    company, post_text, post_url, score, date_found)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (post_id, poster_name, poster_title, poster_url,
+                 company, post_text, post_url, score,
+                 datetime.now().isoformat()),
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def hiring_post_exists(self, post_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM hiring_posts WHERE post_id = ?", (post_id,)
+        ).fetchone()
+        return row is not None
+
+    def mark_post_engaged(self, post_id: str, action: str):
+        self.conn.execute(
+            "UPDATE hiring_posts SET engaged = 1, action_taken = ? WHERE post_id = ?",
+            (action, post_id),
+        )
+        self.conn.commit()
+
+    def mark_post_skipped(self, post_id: str, reason: str):
+        """Record skip reason without counting toward engagement limit."""
+        self.conn.execute(
+            "UPDATE hiring_posts SET action_taken = ? WHERE post_id = ?",
+            (reason, post_id),
+        )
+        self.conn.commit()
+
+    def weekly_post_engagements(self) -> int:
+        seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        row = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM hiring_posts "
+            "WHERE engaged = 1 AND action_taken IN ('connection_sent', 'dm_sent') "
+            "AND date_found >= ?",
+            (seven_days_ago,),
+        ).fetchone()
+        return row["cnt"] if row else 0
 
     def close(self):
         self.conn.close()

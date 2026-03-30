@@ -34,13 +34,10 @@ class Config:
 
     # ── Multi-Location Search ─────────────────────────────────────
     # Each tuple: (location_string, [work_type_filters])
-    # Strategy: cast the widest net possible, minimize overlap.
-    # Canada-wide already catches Toronto/Vancouver/etc for on-site.
-    # US/remote combos catch companies offering remote to Canadians.
+    # Single Canada-wide search catches everything in one pass.
+    # Toronto/GTA jobs get a scoring boost in _score_job_relevance.
     JOB_SEARCH_LOCATIONS: list[tuple[str, list[str]]] = [
-        ("Canada", ["remote", "on_site", "hybrid"]),           # all Canadian jobs
-        ("Toronto, Ontario, Canada", ["remote", "hybrid"]),    # TO remote/hybrid (different results than Canada-wide)
-        ("Vancouver, British Columbia, Canada", ["remote", "hybrid"]),  # BC remote/hybrid
+        ("Canada", ["remote", "on_site", "hybrid"]),
     ]
 
     # How far back to search for job postings (default: 1 week)
@@ -48,20 +45,28 @@ class Config:
     JOB_POSTED_WITHIN: str = os.getenv("JOB_POSTED_WITHIN", "r604800")
 
     # ── Referral Outreach ─────────────────────────────────────────────
-    # Budget: 200 connections/week hard cap (the REAL limiter).
-    # Daily targets are set high because in practice 50–70% of
-    # companies get skipped (no contacts, already messaged, failed sends).
-    # The weekly cap stops us before we overdo it.
-    DAILY_TARGET_MIN: int = int(os.getenv("DAILY_TARGET_MIN", "80"))
-    DAILY_TARGET_MAX: int = int(os.getenv("DAILY_TARGET_MAX", "100"))
+    # CONSERVATIVE limits — the old version ran 25–40/day with 180/week
+    # and never got a single warning.  We got greedy → LinkedIn noticed.
+    # Rule: it's ALWAYS better to send fewer, higher-quality referrals
+    # than to blast 200/day and get restricted.
+    DAILY_TARGET_MIN: int = int(os.getenv("DAILY_TARGET_MIN", "35"))
+    DAILY_TARGET_MAX: int = int(os.getenv("DAILY_TARGET_MAX", "55"))
     MAX_MESSAGES_PER_DAY: int = DAILY_TARGET_MAX   # overridden at runtime
-    # 5 per company × many companies = wide net, weekly cap = safety.
-    MAX_MESSAGES_PER_COMPANY: int = int(os.getenv("MAX_MESSAGES_PER_COMPANY", "5"))
-    MESSAGE_DELAY_MIN: int = int(os.getenv("MESSAGE_DELAY_MIN", "60"))
-    MESSAGE_DELAY_MAX: int = int(os.getenv("MESSAGE_DELAY_MAX", "180"))
+    # 3 per company keeps it realistic — nobody cold-messages 5 strangers
+    # at the same company in one sitting.
+    MAX_MESSAGES_PER_COMPANY: int = int(os.getenv("MAX_MESSAGES_PER_COMPANY", "3"))
+    # Delay between sends — 30s to 75s.  The bot has 7 layers of
+    # protection (fatigue, velocity throttle, breaks, browse-without-acting,
+    # feed engagement, page variety, skip days) so the per-send delay
+    # just needs to look natural, not be the primary safety lever.
+    MESSAGE_DELAY_MIN: int = int(os.getenv("MESSAGE_DELAY_MIN", "30"))
+    MESSAGE_DELAY_MAX: int = int(os.getenv("MESSAGE_DELAY_MAX", "75"))
 
     # ── Weekly Safety Limits (LinkedIn monitors these) ────────────────
-    MAX_PROFILE_VIEWS_PER_WEEK: int = int(os.getenv("MAX_PROFILE_VIEWS_PER_WEEK", "800"))
+    # LinkedIn's actual weekly connection limit is ~100-200 depending on
+    # account age, network size, and Premium status.  We stay well under.
+    # After the warning: cut everything roughly in HALF from the old limits.
+    MAX_PROFILE_VIEWS_PER_WEEK: int = int(os.getenv("MAX_PROFILE_VIEWS_PER_WEEK", "600"))
     MAX_CONNECTIONS_PER_WEEK: int = int(os.getenv("MAX_CONNECTIONS_PER_WEEK", "200"))
 
     # ── Contact Filtering ─────────────────────────────────────────────
@@ -74,6 +79,112 @@ class Config:
             "youtuber,volunteer,unemployed",
         ).split(",")
     ]
+
+    # ── Post Hunting ("Hiring" posts on LinkedIn feed) ────────────────
+    POST_HUNT_ENABLED: bool = os.getenv("POST_HUNT_ENABLED", "true").lower() == "true"
+
+    # --- Build POST_HUNT_KEYWORDS dynamically from JOB_KEYWORDS -------
+    # Each role gets paired with every hiring phrase, then we add
+    # generic "we're hiring" / "open to work" variations on top.
+    _HIRING_PHRASES: list[str] = [
+        "hiring {role}",
+        "we're hiring {role}",
+        "we are hiring {role}",
+        "my team is hiring {role}",
+        "our team is hiring {role}",
+        "looking for {role}",
+        "looking for a {role}",
+        "open role {role}",
+        "open position {role}",
+        "join my team {role}",
+        "join our team {role}",
+        "{role} needed",
+        "{role} wanted",
+        "{role} opening",
+        "{role} position",
+        "hiring a {role}",
+        "come work with us {role}",
+        "new role {role}",
+        "{role} role",
+        "{role} opportunity",
+    ]
+    # Generic hiring phrases (no role, just catch-all)
+    _GENERIC_HIRING_PHRASES: list[str] = [
+        "we're hiring Canada",
+        "hiring in Canada",
+        "hiring in Toronto",
+        "hiring in Vancouver",
+        "hiring in Montreal",
+        "hiring in Ottawa",
+        "hiring in Calgary",
+        "hiring engineers Canada",
+        "my team is hiring",
+        "open roles engineering",
+        "come join our engineering team",
+        "engineering team is growing",
+        "growing our team engineers",
+        "multiple openings engineer",
+        "urgently hiring developer",
+        "immediately hiring engineer",
+        "tech hiring Canada",
+        "startup hiring engineers",
+        # Canada-specific patterns that yield better results
+        "hiring Toronto software",
+        "hiring Vancouver developer",
+        "hiring Montreal engineer",
+        "hiring Ottawa tech",
+        "team growing Toronto",
+        "team growing Vancouver",
+        "join us Toronto engineer",
+        "join us Vancouver developer",
+        "open role Toronto",
+        "open role Vancouver",
+        "open role Montreal",
+        "Canada remote developer",
+        "Canada remote engineer",
+        "Canadian tech company hiring",
+        "Canadian startup hiring",
+        "GTA hiring developer",
+        "Ontario hiring engineer",
+        "BC hiring developer",
+        "Alberta hiring engineer",
+        "waterloo hiring software",
+        "kitchener hiring engineer",
+        "hiring hybrid Toronto",
+        "hiring hybrid Vancouver",
+        "referral Canada software",
+        "referral Toronto developer",
+    ]
+
+    # Build the full keyword list: role × phrase + generics
+    _role_keywords_raw: list[str] = []
+    for _role in JOB_KEYWORDS:
+        # Normalise: "Full-Stack Developer" → "full stack developer"
+        _role_norm = _role.lower().replace("-", " ")
+        # Also make a short version: "Backend Engineer" → "backend"
+        _role_short = _role_norm.split()[0] if _role_norm else _role_norm
+        for _phrase in _HIRING_PHRASES:
+            _role_keywords_raw.append(_phrase.format(role=_role_norm))
+            # Short variant only if the short form is meaningful (≥6 chars)
+            # Avoids useless queries like "hiring full" or "looking for cloud"
+            if _role_short != _role_norm and len(_role_short) >= 6:
+                _role_keywords_raw.append(_phrase.format(role=_role_short))
+    _role_keywords_raw.extend(_GENERIC_HIRING_PHRASES)
+    # Deduplicate while preserving order
+    _seen_kw: set[str] = set()
+    POST_HUNT_KEYWORDS: list[str] = []
+    for _kw in _role_keywords_raw:
+        _lower = _kw.strip().lower()
+        if _lower not in _seen_kw:
+            _seen_kw.add(_lower)
+            POST_HUNT_KEYWORDS.append(_kw.strip())
+    del _role_keywords_raw, _seen_kw, _kw, _lower  # clean up temps
+    # Max posts to engage with per run (keep it very human)
+    POST_HUNT_MAX_PER_RUN: int = int(os.getenv("POST_HUNT_MAX_PER_RUN", "8"))
+    # Max post engagements per week (separate from connection budget)
+    POST_HUNT_MAX_PER_WEEK: int = int(os.getenv("POST_HUNT_MAX_PER_WEEK", "25"))
+    # Minimum legitimacy score (0-100) to engage with a post
+    POST_HUNT_MIN_SCORE: int = int(os.getenv("POST_HUNT_MIN_SCORE", "25"))
 
     # ── Schedule ──────────────────────────────────────────────────────
     DAILY_RUN_HOUR: int = int(os.getenv("DAILY_RUN_HOUR", "9"))
@@ -167,10 +278,33 @@ class Config:
 
     @classmethod
     def validate(cls) -> list[str]:
-        """Return a list of missing critical config values."""
+        """Return a list of missing or invalid config values."""
         issues = []
         if not cls.LINKEDIN_EMAIL:
             issues.append("LINKEDIN_EMAIL is not set")
+        elif "@" not in cls.LINKEDIN_EMAIL:
+            issues.append("LINKEDIN_EMAIL doesn't look like a valid email")
         if not cls.LINKEDIN_PASSWORD:
             issues.append("LINKEDIN_PASSWORD is not set")
+        # Bounds-check numeric limits to catch typos / bad .env values
+        if cls.DAILY_TARGET_MIN < 1 or cls.DAILY_TARGET_MAX > 200:
+            issues.append(
+                f"DAILY_TARGET range {cls.DAILY_TARGET_MIN}–{cls.DAILY_TARGET_MAX} "
+                f"looks wrong (expected 1–200)"
+            )
+        if cls.MAX_CONNECTIONS_PER_WEEK > 500:
+            issues.append(
+                f"MAX_CONNECTIONS_PER_WEEK={cls.MAX_CONNECTIONS_PER_WEEK} is dangerously high"
+            )
+        if cls.MESSAGE_DELAY_MIN < 5:
+            issues.append(
+                f"MESSAGE_DELAY_MIN={cls.MESSAGE_DELAY_MIN}s is too aggressive (min 5)"
+            )
         return issues
+
+    def __repr__(self) -> str:
+        """Mask password in any repr / traceback / log output."""
+        return (
+            f"<Config email={self.LINKEDIN_EMAIL!r} "
+            f"password={'*' * 8} headless={self.HEADLESS}>"
+        )

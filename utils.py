@@ -3,8 +3,12 @@ Utility helpers — logging, browser setup, human-like delays.
 """
 
 import logging
+import os
+from logging.handlers import RotatingFileHandler
 import random
+import shutil
 import time
+import uuid
 from pathlib import Path
 
 from selenium import webdriver
@@ -19,18 +23,16 @@ from config import Config
 
 
 # ── Anti-detection: rotating User-Agent pool ──────────────────────────
-# Recent Chrome UA strings across platforms — one picked randomly per session.
+# WINDOWS ONLY — using macOS UAs on a Windows machine creates an instant
+# fingerprint contradiction (WebRTC/canvas/platform leak the real OS).
+# Current Chrome versions (143–145) — updated March 2026.
 _USER_AGENTS = [
-    # Chrome 120 – Windows 10
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # Chrome 121 – Windows 10
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    # Chrome 122 – Windows 11
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    # Chrome 120 – macOS Sonoma
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # Chrome 121 – macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    # Chrome 143 – Windows 10/11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+    # Chrome 144 – Windows 10/11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    # Chrome 145 – Windows 10/11 (current stable)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
 ]
 
 # ── Anti-detection: window size pool ──────────────────────────────────
@@ -47,46 +49,84 @@ _WINDOW_SIZES = [
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Create a configured logger."""
+    """Create a configured logger.
+
+    Console: shows INFO+ (clean, readable output).
+    File:    captures DEBUG+ (full diagnostic history for troubleshooting).
+    """
     logger = logging.getLogger(name)
     if not logger.handlers:
-        logger.setLevel(getattr(logging, Config.LOG_LEVEL, logging.INFO))
+        # Logger itself allows everything; handlers filter by level.
+        logger.setLevel(logging.DEBUG)
         fmt = logging.Formatter(
             "%(asctime)s | %(name)-18s | %(levelname)-7s | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        # Console
+        # Console — INFO+ only (clean output, no debug noise)
         ch = logging.StreamHandler()
+        ch.setLevel(getattr(logging, Config.LOG_LEVEL, logging.INFO))
         ch.setFormatter(fmt)
         logger.addHandler(ch)
-        # File
+        # File — DEBUG+ (full history for post-mortem analysis)
+        # Rotating: 5 MB per file, keep last 5 backups (~25 MB max)
         log_dir = Path(__file__).parent / "data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_dir / "bot.log", encoding="utf-8")
+        fh = RotatingFileHandler(
+            log_dir / "bot.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     return logger
 
 
+# ── Persistent bot profile directory ──────────────────────────────
+# A SINGLE persistent profile is reused across runs.  This is critical:
+# LinkedIn fingerprints fresh/empty profiles as bot behaviour.  A real
+# user's Chrome profile accumulates cookies, localStorage, IndexedDB,
+# service workers, and cache entries over time.  Nuking the profile
+# every run was a major detection signal — every session looked like
+# a brand-new browser that had never visited LinkedIn before.
+_BOT_PROFILES_ROOT = Path(Config.CHROME_PROFILE_PATH).parent / "chrome-bot-profiles" \
+    if Config.CHROME_PROFILE_PATH else Path.home() / ".linkedin-bot-profiles"
+_PERSISTENT_PROFILE = _BOT_PROFILES_ROOT / "persistent"
+
+
 def create_driver() -> webdriver.Chrome:
-    """Spin up a Chrome driver with comprehensive anti-detection."""
+    """Spin up a Chrome driver with a fresh, disposable profile.
+
+    A unique user-data-dir is created for this run. The path is stored
+    on ``driver._bot_profile_dir`` so callers can nuke it via
+    :func:`cleanup_driver`.
+    """
     opts = Options()
 
     if Config.HEADLESS:
         opts.add_argument("--headless=new")
 
-    # Use a SEPARATE user-data-dir for the bot so it never conflicts
-    # with the user's default Chrome profile (which blocks remote-debugging).
-    bot_data_dir = str(Path(Config.CHROME_PROFILE_PATH).parent / "Chrome Bot Data") \
-        if Config.CHROME_PROFILE_PATH else str(Path.home() / ".linkedin-bot-chrome")
-    opts.add_argument(f"--user-data-dir={bot_data_dir}")
+    # Persistent profile — reused across runs so LinkedIn sees an
+    # established browser with cookies, cache, and history.  A fresh
+    # profile every run was a major detection signal.
+    _PERSISTENT_PROFILE.mkdir(parents=True, exist_ok=True)
+    opts.add_argument(f"--user-data-dir={_PERSISTENT_PROFILE}")
 
     # Anti-detection flags
+    # Suppress Chrome's noisy internal logs (STUN, GCM, USB, TensorFlow)
+    # These are harmless Chrome subsystem messages, not bot errors.
+    opts.add_argument("--log-level=3")
+    opts.add_argument("--disable-logging")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--no-sandbox")
+
+    # Extra anti-fingerprinting flags
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
 
     # Random window size each session
     win_w, win_h = random.choice(_WINDOW_SIZES)
@@ -97,6 +137,8 @@ def create_driver() -> webdriver.Chrome:
     opts.add_argument(f"user-agent={chosen_ua}")
 
     service = Service(ChromeDriverManager().install())
+    # Redirect chromedriver's own logs away from console
+    service.creation_flags = 0x08000000  # CREATE_NO_WINDOW (Windows)
     driver = webdriver.Chrome(service=service, options=opts)
 
     # ── selenium-stealth: patches fingerprint vectors ─────────────
@@ -108,7 +150,7 @@ def create_driver() -> webdriver.Chrome:
         vendor="Google Inc.",
         platform="Win32",
         webgl_vendor="Intel Inc.",
-        renderer="Intel Iris OpenGL Engine",
+        renderer="Intel UHD Graphics 620",
         fix_hairline=True,
     )
 
@@ -117,10 +159,62 @@ def create_driver() -> webdriver.Chrome:
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
 
+    # ── CDP detection mitigation ────────────────────────────────
+    # Patch navigator.plugins to look like a real browser (non-empty)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
+        // Override plugins to look real (empty plugins = headless/bot)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+        // Override languages (consistent with stealth config)
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+        // Prevent detection via permissions API timing attack
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+        // Chrome runtime should exist on real Chrome
+        window.chrome = window.chrome || {};
+        window.chrome.runtime = window.chrome.runtime || {};
+    """})
+
     log = get_logger("utils")
     log.info(f"🖥️  Window: {win_w}×{win_h} | UA: ...Chrome/{chosen_ua.split('Chrome/')[1][:5]}")
+    log.info(f"📂 Persistent profile: {_PERSISTENT_PROFILE.name}")
 
     return driver
+
+
+def cleanup_driver(driver: webdriver.Chrome) -> None:
+    """Quit the browser.  The persistent profile is kept for next run.
+
+    Keeping the profile avoids the 'brand new browser' fingerprint
+    that LinkedIn flags.  Cookies, cache, and localStorage persist.
+    """
+    log = get_logger("utils")
+    try:
+        driver.quit()
+        log.info("🔒 Browser closed (persistent profile kept for next run).")
+    except Exception:
+        pass
+
+
+def purge_old_profiles() -> None:
+    """Delete any leftover disposable profile dirs from old bot versions."""
+    log = get_logger("utils")
+    if not _BOT_PROFILES_ROOT.exists():
+        return
+    cleaned = 0
+    for child in _BOT_PROFILES_ROOT.iterdir():
+        if child.is_dir() and child.name.startswith("run_"):
+            shutil.rmtree(child, ignore_errors=True)
+            cleaned += 1
+    if cleaned:
+        log.info(f"🧹 Purged {cleaned} leftover disposable profile dir(s).")
 
 
 def human_delay(min_sec: float = 1.0, max_sec: float = 3.0):
@@ -139,20 +233,31 @@ def human_delay(min_sec: float = 1.0, max_sec: float = 3.0):
 def long_delay():
     """Longer pause between major actions (message sends, page transitions).
     
-    Uses a weighted random strategy so most pauses are short (8-15s)
-    but occasionally there's a longer 'human' pause (30-90s) to
+    Uses a weighted random strategy so most pauses are moderate (30-75s)
+    but occasionally there's a longer 'human' pause (1-2 min) to
     mimic someone checking their phone, reading a profile, etc.
+    
+    Also applies session fatigue multiplier when available.
     """
+    # Try to apply fatigue multiplier from antidetect module
+    try:
+        from antidetect import get_session
+        fatigue = get_session().fatigue_multiplier
+    except Exception:
+        fatigue = 1.0
+
     roll = random.random()
-    if roll < 0.70:
-        # 70% — normal pace
-        time.sleep(random.uniform(Config.MESSAGE_DELAY_MIN, Config.MESSAGE_DELAY_MAX))
-    elif roll < 0.90:
-        # 20% — slightly longer pause (looking at something)
-        time.sleep(random.uniform(20, 40))
+    if roll < 0.75:
+        # 75% — normal pace
+        base = random.uniform(Config.MESSAGE_DELAY_MIN, Config.MESSAGE_DELAY_MAX)
+    elif roll < 0.92:
+        # 17% — slightly longer pause (reading something)
+        base = random.uniform(30, 60)
     else:
-        # 10% — long pause (bathroom break, coffee, phone)
-        time.sleep(random.uniform(45, 90))
+        # 8% — long pause (bathroom break, coffee, phone call)
+        base = random.uniform(60, 120)
+
+    time.sleep(base * fatigue)
 
 
 def scroll_page(driver: webdriver.Chrome, scrolls: int = 3):
@@ -210,3 +315,23 @@ def simulate_random_mouse_movement(driver: webdriver.Chrome):
         actions.perform()
     except Exception:
         pass  # non-critical, swallow silently
+
+
+def clear_session_cookies(driver: webdriver.Chrome):
+    """Clear cookies and browser storage for the current session.
+
+    Used by login smoke tests to ensure each run starts from a clean
+    auth state without touching the persistent profile on disk.
+    """
+    try:
+        driver.delete_all_cookies()
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script(
+            "window.localStorage && window.localStorage.clear();"
+            "window.sessionStorage && window.sessionStorage.clear();"
+        )
+    except Exception:
+        pass

@@ -61,19 +61,67 @@ def login(driver: webdriver.Chrome) -> bool:
     try:
         wait = WebDriverWait(driver, 15)
 
+        # Log what we see before interacting
+        logger.info(f"  Login page URL: {driver.current_url}")
+        logger.info(f"  Login page title: {driver.title}")
+
         # Email
+        logger.debug("Looking for #username field …")
         email_field = wait.until(
             EC.presence_of_element_located((By.ID, "username"))
         )
+        logger.debug(f"  Found #username: tag={email_field.tag_name}, displayed={email_field.is_displayed()}")
+
+        # Ensure the field is clickable (dismiss overlays)
+        WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "username"))
+        )
+
         email_field.clear()
         _type_like_human(email_field, Config.LINKEDIN_EMAIL)
+        logger.debug("  Typed email.")
         human_delay(0.5, 1)
 
         # Password
-        pw_field = driver.find_element(By.ID, "password")
+        logger.debug("Looking for #password field …")
+        pw_field = wait.until(
+            EC.presence_of_element_located((By.ID, "password"))
+        )
+        WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "password"))
+        )
+        pw_field.click()
+        logger.debug(f"  Found #password: tag={pw_field.tag_name}, displayed={pw_field.is_displayed()}")
         pw_field.clear()
         _type_like_human(pw_field, Config.LINKEDIN_PASSWORD)
+        logger.debug("  Typed password.")
         human_delay(0.5, 1)
+
+        # Uncheck "Keep me logged in" — belt-and-suspenders alongside
+        # the disposable profile nuke.  If a crash prevents cleanup,
+        # LinkedIn won't issue a long-lived session cookie.
+        try:
+            remember_me = None
+            for selector in [
+                (By.ID, "rememberMeOptIn-checkbox"),
+                (By.NAME, "rememberMe"),
+                (By.CSS_SELECTOR, "input[name='rememberMeOptIn']"),
+            ]:
+                try:
+                    remember_me = driver.find_element(*selector)
+                    break
+                except Exception:
+                    continue
+
+            if remember_me and remember_me.is_selected():
+                # The real checkbox is hidden behind the form overlay,
+                # so a normal .click() gets intercepted. Use JS instead.
+                driver.execute_script("arguments[0].click();", remember_me)
+                logger.debug("  Unchecked 'Keep me logged in' via JS.")
+            elif remember_me:
+                logger.debug("  'Keep me logged in' already unchecked.")
+        except Exception as e:
+            logger.debug(f"  Remember-me handling error: {e}")
 
         # Submit
         pw_field.send_keys(Keys.RETURN)
@@ -107,7 +155,7 @@ def login(driver: webdriver.Chrome) -> bool:
             return False
 
     except Exception as e:
-        logger.error(f"Login error: {e}")
+        logger.error(f"Login error ({type(e).__name__}): {e}")
         return False
 
 
@@ -161,7 +209,12 @@ def _is_logged_in(driver: webdriver.Chrome) -> bool:
 
 
 def _log_login_failure(driver: webdriver.Chrome):
-    """Save diagnostic info when login fails."""
+    """Save diagnostic info when login fails.
+
+    Only saves a screenshot (visual-only, no tokens/HTML).
+    Page source is NOT saved — it may contain CSRF tokens, session
+    fragments, or other sensitive data that shouldn't sit on disk.
+    """
     logger.error("❌ Login failed — could not verify authenticated session.")
     logger.error(f"  Current URL: {driver.current_url}")
     logger.error(f"  Page title:  {driver.title}")
@@ -170,10 +223,7 @@ def _log_login_failure(driver: webdriver.Chrome):
         debug_dir = Path(__file__).parent / "data"
         debug_dir.mkdir(parents=True, exist_ok=True)
         driver.save_screenshot(str(debug_dir / "login_failure.png"))
-        (debug_dir / "login_failure.html").write_text(
-            driver.page_source, encoding="utf-8"
-        )
-        logger.error("  📸 Screenshot & page source saved to data/login_failure.*")
+        logger.error("  📸 Screenshot saved to data/login_failure.png")
     except Exception:
         pass
 
