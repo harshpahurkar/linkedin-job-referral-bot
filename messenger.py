@@ -4,6 +4,7 @@ and sends referral request messages.
 """
 
 import hashlib
+import json
 import random
 import re
 import urllib.parse
@@ -1199,6 +1200,7 @@ def _send_connection_with_note(
         get_session().record_profile_view()
         realistic_profile_reading(driver)
 
+        # _get_connection_status scrolls to top internally
         status = _get_connection_status(driver)
         logger.debug(
             f"  Profile {contact.name}: connection status = '{status}', "
@@ -1208,65 +1210,275 @@ def _send_connection_with_note(
             logger.info(f"  🔗 Already connected to {contact.name} — sending DM")
             return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
         if status == "pending":
-            logger.debug(f"  Connection already pending for {contact.name}, skipping")
-            return "failed"
+            logger.debug(f"  Connection already pending for {contact.name}, trying DM")
+            return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
 
         # Step 1: Find and click the Connect button (direct or inside "More")
-        clicked = _click_connect_button(driver)
+        clicked = _click_connect_button(driver, expected_name=contact.name)
         if not clicked:
-            logger.debug(f"  No Connect button for {contact.name}")
-            return "failed"
+            logger.debug(f"  No Connect button for {contact.name}; trying direct Message fallback")
+            return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
 
         human_delay(0.5, 1)
 
-        # Step 2: Look for the "Add a note" button in the connection modal
-        add_note_clicked = driver.execute_script("""
-            const buttons = document.querySelectorAll('button');
-            for (const btn of buttons) {
-                const text = btn.textContent.trim().toLowerCase();
-                const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                if ((text.includes('add a note') || label.includes('add a note'))
-                    && btn.offsetParent !== null) {
-                    btn.click();
-                    return true;
+        # Some LinkedIn layouts require a second click on a visible
+        # Connect option in a popover/menu after the first click.
+        if _click_secondary_connect_option(driver):
+            logger.debug("  Clicked secondary Connect option after initial click")
+            human_delay(0.5, 1)
+
+        # Close any leftover More dropdown that might overlap with the modal
+        try:
+            driver.execute_script("""
+                // Press Escape to close any open dropdown/popover
+                document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+                // Also try clicking outside the dropdown
+                const dropdowns = document.querySelectorAll(
+                    'div.artdeco-dropdown__content--is-open, [role="menu"]'
+                );
+                for (const dd of dropdowns) {
+                    if (dd && dd.offsetParent !== null) {
+                        const toggle = dd.previousElementSibling;
+                        if (toggle && toggle.getAttribute('aria-expanded') === 'true') {
+                            toggle.click();
+                        }
+                    }
+                }
+            """)
+        except Exception:
+            pass
+
+        # DO NOT check _is_invite_pending here — it can false-match "Pending"
+        # text on the profile page (e.g., "Connect if you know each other → Pending").
+        # Instead, we proceed to look for the "Add a note" modal first.
+        # _is_invite_pending is only checked later as a last resort.
+
+        # Step 2: Wait for modal to appear and look for "Add a note" button
+        import time as _time
+        from selenium.webdriver.common.action_chains import ActionChains as _AC
+        from selenium.webdriver.common.by import By as _By
+
+        # Give the modal time to animate in
+        _time.sleep(2.0)
+
+        # LinkedIn 2026 renders the invitation modal inside a Shadow DOM
+        # (host: div.theme--light).  Regular querySelectorAll and Selenium
+        # XPath cannot pierce Shadow DOM, so we must use JS to access
+        # shadowRoot and find elements inside it.
+
+        # Helper: find shadow root containing the modal
+        def _find_shadow_modal_btn(driver, text_match):
+            """Search all shadow roots for a button whose text includes text_match."""
+            return driver.execute_script("""
+                const target = arguments[0].toLowerCase();
+                // Find all shadow hosts
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    if (!el.shadowRoot) continue;
+                    const btns = el.shadowRoot.querySelectorAll('button, a, [role="button"]');
+                    for (const btn of btns) {
+                        const r = btn.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) continue;
+                        const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                        const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                        if (text.includes(target) || label.includes(target)) {
+                            return btn;
+                        }
+                    }
+                    // Also recurse into nested shadow roots
+                    const nested = el.shadowRoot.querySelectorAll('*');
+                    for (const nel of nested) {
+                        if (!nel.shadowRoot) continue;
+                        const nbtns = nel.shadowRoot.querySelectorAll('button, a, [role="button"]');
+                        for (const btn of nbtns) {
+                            const r = btn.getBoundingClientRect();
+                            if (r.width === 0 || r.height === 0) continue;
+                            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            if (text.includes(target) || label.includes(target)) {
+                                return btn;
+                            }
+                        }
+                    }
+                }
+                return null;
+            """, text_match)
+
+        def _find_shadow_textarea(driver):
+            """Search all shadow roots for a textarea or contenteditable."""
+            return driver.execute_script("""
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    if (!el.shadowRoot) continue;
+                    // textarea
+                    const tas = el.shadowRoot.querySelectorAll('textarea');
+                    for (const ta of tas) {
+                        const r = ta.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return ta;
+                    }
+                    // contenteditable
+                    const ces = el.shadowRoot.querySelectorAll('[contenteditable="true"]');
+                    for (const ce of ces) {
+                        const r = ce.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) return ce;
+                    }
+                }
+                return null;
+            """)
+
+        # Debug: check if shadow modal exists
+        shadow_debug = driver.execute_script("""
+            const allEls = document.querySelectorAll('*');
+            for (const el of allEls) {
+                if (!el.shadowRoot) continue;
+                const text = (el.shadowRoot.textContent || '').toLowerCase();
+                if (text.includes('add a note') || text.includes('invitation')) {
+                    const btns = el.shadowRoot.querySelectorAll('button, a');
+                    const btnTexts = [];
+                    for (const b of btns) {
+                        const t = (b.innerText || '').trim();
+                        if (t) btnTexts.push(t);
+                    }
+                    return JSON.stringify({shadowHost: el.tagName + '.' + (el.className||'').substring(0,30), buttons: btnTexts});
                 }
             }
-            return false;
+            return '{"shadowHost":"none","buttons":[]}';
         """)
+        logger.debug(f"  Shadow modal check: {shadow_debug}")
 
-        if add_note_clicked:
+        # Step 2: Find and click "Add a note" button
+        add_note_btn = None
+        for attempt in range(10):
+            # Try shadow DOM first (LinkedIn 2026 standard)
+            add_note_btn = _find_shadow_modal_btn(driver, "add a note")
+            if add_note_btn:
+                logger.debug(f"  Found 'Add a note' in shadow DOM on attempt {attempt + 1}")
+                break
+
+            # Fallback: try regular DOM (older LinkedIn layouts)
+            try:
+                candidates = driver.find_elements(
+                    _By.XPATH,
+                    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'add a note')]"
+                    " | //a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'add a note')]"
+                )
+                for btn in candidates:
+                    if btn.is_displayed() and btn.is_enabled():
+                        add_note_btn = btn
+                        logger.debug(f"  Found 'Add a note' in regular DOM on attempt {attempt + 1}")
+                        break
+            except Exception:
+                pass
+
+            if add_note_btn:
+                break
+            _time.sleep(0.5)
+
+        if add_note_btn:
+            # JS click works reliably for both shadow DOM and regular DOM elements
+            try:
+                driver.execute_script("arguments[0].click();", add_note_btn)
+                logger.debug("  Clicked 'Add a note' via JS click")
+            except Exception:
+                try:
+                    _AC(driver).move_to_element(add_note_btn).pause(0.15).click().perform()
+                    logger.debug("  Clicked 'Add a note' via ActionChains")
+                except Exception as e:
+                    logger.debug(f"  Failed to click 'Add a note': {e}")
             human_delay(0.5, 1)
         else:
             logger.debug("  No 'Add a note' button — may already show textarea")
 
         # Step 3: Find the textarea and type the message
-        try:
-            note_field = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR,
-                     "textarea[name='message'], textarea#custom-message, "
-                     "textarea.connect-button-send-invite__custom-message")
-                )
-            )
-        except TimeoutException:
-            # Fallback: any visible textarea
-            note_field = driver.execute_script("""
-                const areas = document.querySelectorAll('textarea');
-                for (const ta of areas) {
-                    if (ta.offsetParent !== null) return ta;
-                }
-                return null;
-            """)
-            if not note_field:
-                logger.debug("  No textarea found — sending without note")
-                return "connection_sent" if _click_send_button(driver) else "failed"
+        # Search shadow DOM first, then regular DOM.
+        note_field = None
+        for _ in range(10):
+            # Shadow DOM textarea/contenteditable
+            note_field = _find_shadow_textarea(driver)
+            if note_field:
+                logger.debug(f"  Found note input in shadow DOM")
+                break
 
-        note_field.clear()
+            # Regular DOM fallback
+            textarea_selectors = [
+                "textarea[name='message']",
+                "textarea#custom-message",
+                "textarea.connect-button-send-invite__custom-message",
+                "div[role='dialog'] textarea",
+                "div.artdeco-modal textarea",
+                "textarea",
+            ]
+            for sel in textarea_selectors:
+                try:
+                    candidates = driver.find_elements(_By.CSS_SELECTOR, sel)
+                    for ta in candidates:
+                        if ta.is_displayed():
+                            note_field = ta
+                            break
+                except Exception:
+                    pass
+                if note_field:
+                    break
+
+            if not note_field:
+                ce_selectors = [
+                    "div[role='dialog'] [contenteditable='true']",
+                    "div.artdeco-modal [contenteditable='true']",
+                ]
+                for sel in ce_selectors:
+                    try:
+                        candidates = driver.find_elements(_By.CSS_SELECTOR, sel)
+                        for ce in candidates:
+                            if ce.is_displayed():
+                                note_field = ce
+                                break
+                    except Exception:
+                        pass
+                    if note_field:
+                        break
+
+            if note_field:
+                logger.debug(f"  Found note input field: {note_field.tag_name}")
+                break
+            _time.sleep(0.5)
+
+        if not note_field:
+                logger.debug("  No note input found — trying send without note")
+                if _click_send_button(driver):
+                    return "connection_sent"
+                if _is_invite_pending(driver):
+                    logger.debug("  No send button, but Pending state is visible — treating as sent")
+                    return "connection_sent"
+                logger.debug("  Connect-note flow failed; trying direct Message fallback")
+                return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
+
+        # Click into the field first (important for shadow DOM elements)
+        try:
+            driver.execute_script("arguments[0].focus(); arguments[0].click();", note_field)
+        except Exception:
+            pass
+
+        try:
+            note_field.clear()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].textContent=''; arguments[0].value='';", note_field)
+            except Exception:
+                pass
+
         _type_message(note_field, message[:300])
         human_delay(0.5, 1)
 
         # Step 4: Click Send
-        return "connection_sent" if _click_send_button(driver) else "failed"
+        if _click_send_button(driver):
+            return "connection_sent"
+        if _is_invite_pending(driver):
+            logger.debug("  Send button not found, but Pending state detected after note flow")
+            return "connection_sent"
+        logger.debug("  Send button still missing; trying direct Message fallback")
+        return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
 
     except Exception as e:
         logger.error(f"Error sending connection to {contact.name}: {e}")
@@ -1286,17 +1498,46 @@ def _send_direct_message(
     import time
 
     try:
+        # Scroll to top so action buttons are visible
+        try:
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.3)
+        except Exception:
+            pass
+
         # Click the "Message" button on the profile page
+        # LinkedIn 2026 renders Message as <a>, not <button>
         msg_clicked = driver.execute_script("""
-            const buttons = document.querySelectorAll('button');
-            for (const btn of buttons) {
-                const label = (btn.getAttribute('aria-label') || '');
-                const rect = btn.getBoundingClientRect();
-                const visible = rect.top > 0 && rect.top < 600 && btn.offsetParent !== null;
-                if (label.startsWith('Message ') && visible) {
-                    btn.click();
-                    return true;
+            const controls = document.querySelectorAll(
+                'button, a, [role="button"]'
+            );
+            let best = null;
+            let bestTop = 999999;
+            for (const ctrl of controls) {
+                if (!ctrl) continue;
+                const rect = ctrl.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                if (ctrl.closest('aside, nav, header[role="banner"]')) continue;
+
+                const label = (ctrl.getAttribute('aria-label') || '').toLowerCase();
+                const text = (ctrl.innerText || ctrl.textContent || '').trim().toLowerCase();
+                const isMessage = label.startsWith('message ') || label === 'message'
+                    || text === 'message' || text.includes('message');
+                if (!isMessage) continue;
+                // Avoid matching "Message top connections" or similar longer text
+                if (text.length > 20) continue;
+
+                if (!(rect.top > -10 && rect.top < 650)) continue;
+                if (rect.left >= window.innerWidth * 0.72) continue;
+
+                if (rect.top < bestTop) {
+                    bestTop = rect.top;
+                    best = ctrl;
                 }
+            }
+            if (best) {
+                best.click();
+                return true;
             }
             return false;
         """)
@@ -1413,261 +1654,461 @@ def _get_connection_status(driver: webdriver.Chrome) -> str:
       1. Normal:       Connect (primary) + Message + More
       2. Follow-first: Follow (primary) + Message + More (Connect inside More)
       3. Connected:    Message (primary) + More (no Connect anywhere)
+
+    Strategy: scroll to top first, then scan <button> elements + elements
+    with role="button" using flexible text matching (includes, not exact).
     """
-    status = driver.execute_script("""
-        const btns = document.querySelectorAll('button');
-        let hasConnect = false;
+    # Scroll to top so action buttons are in viewport
+    try:
+        driver.execute_script("window.scrollTo(0, 0);")
+    except Exception:
+        pass
+    import time as _t
+    _t.sleep(0.5)
+
+    result = driver.execute_script("""
+        // Phase 1: Scan <button>, <a>, and [role="button"] elements in the
+        // profile action area.  LinkedIn 2026 renders Connect/Message as <a>
+        // links styled as buttons, not actual <button> elements.
+        const candidates = document.querySelectorAll(
+            'button, a, [role="button"]'
+        );
+        let hasConnectDirect = false;
         let hasMessage = false;
         let hasPending = false;
-        let hasFollowPrimary = false;
+        let hasFollow = false;
+        const debugBtns = [];
 
-        for (const btn of btns) {
-            const label = (btn.getAttribute('aria-label') || '');
-            const rect = btn.getBoundingClientRect();
-            const inHeader = rect.top > 0 && rect.top < 600 && btn.offsetParent !== null;
+        for (const el of candidates) {
+            if (!el || el.offsetParent === null) continue;
 
-            // Direct "Invite X to connect" button
-            if (label.includes('Invite') && label.includes('to connect')) {
-                hasConnect = true;
+            // Skip sidebar, nav, banner
+            if (el.closest('aside')) continue;
+            if (el.closest('nav')) continue;
+            if (el.closest('header[role="banner"]')) continue;
+
+            const rect = el.getBoundingClientRect();
+            // Profile action buttons are in the top portion of the page
+            if (rect.top < -10 || rect.top >= 650) continue;
+            // Exclude far-right sidebar elements
+            if (rect.left >= window.innerWidth * 0.72) continue;
+
+            const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+            const label = (el.getAttribute('aria-label') || '').toLowerCase();
+            const blob = text + ' ' + label;
+
+            // Collect debug info for first 15 buttons
+            if (debugBtns.length < 15) {
+                debugBtns.push(text.substring(0, 30) + '|' + label.substring(0, 40)
+                    + '|t=' + Math.round(rect.top) + ',l=' + Math.round(rect.left));
             }
-            // "Message <name>" button in the header area
-            if (label.startsWith('Message ') && inHeader) {
-                hasMessage = true;
-            }
-            if (label.includes('Pending') || btn.textContent.trim() === 'Pending') {
+
+            // PENDING detection
+            if (text.includes('pending') || label.includes('pending')
+                || label.includes('withdraw invitation') || label.includes('invitation sent')) {
                 hasPending = true;
             }
-            // Detect Follow as the PRIMARY action in the header
-            // (artdeco-button--primary = the filled/blue button)
-            if (label.startsWith('Follow ') && inHeader
-                && btn.className.includes('artdeco-button--primary')) {
-                hasFollowPrimary = true;
+
+            // CONNECT detection (handles "Connect", "+ Connect", icon text + "Connect", etc.)
+            if ((text.includes('connect') && !text.includes('disconnect')
+                 && !text.includes('connections') && !text.includes('connected'))
+                || (label.includes('connect') && label.includes('invite')
+                    && !label.includes('disconnect'))) {
+                hasConnectDirect = true;
+            }
+
+            // MESSAGE detection (handles "Message", icon + "Message", etc.)
+            if (text.includes('message') || label.startsWith('message ')
+                || label === 'message') {
+                hasMessage = true;
+            }
+
+            // FOLLOW detection (handles "Follow", "+ Follow", etc.)
+            // If we see Follow in the action area and no Connect, it's a follow-first layout
+            if ((text.includes('follow') && !text.includes('unfollow')
+                 && !text.includes('follower'))
+                || (label.startsWith('follow ') && !label.includes('unfollow'))) {
+                hasFollow = true;
             }
         }
 
-        // Check the More dropdown for Connect (items exist in DOM even when closed)
-        // Use broad selector: any div with class artdeco-dropdown__item and the right aria-label
-        const ddItems = document.querySelectorAll(
-            '.artdeco-dropdown__item[aria-label*="Invite"][aria-label*="to connect"], '
-            + 'div[role="button"][aria-label*="Invite"][aria-label*="to connect"]'
-        );
-        if (ddItems.length > 0) hasConnect = true;
+        // Phase 2: If nothing found via buttons, scan leaf text nodes
+        // as a fallback (LinkedIn may use custom non-button elements).
+        if (!hasConnectDirect && !hasMessage && !hasPending && !hasFollow) {
+            const allElements = document.querySelectorAll('*');
+            for (const el of allElements) {
+                if (!el || el.offsetParent === null) continue;
+                if (el.children && el.children.length > 2) continue;  // prefer leaf-ish nodes
+                if (el.closest('aside, nav, header[role="banner"]')) continue;
 
-        if (hasPending) return 'pending';
-        if (hasConnect) return 'connect';
-        // Follow-first profile: Follow is primary + Message visible,
-        // but Connect is hidden in More dropdown — NOT connected!
-        if (hasFollowPrimary && hasMessage) return 'connect';
-        if (hasMessage && !hasConnect && !hasFollowPrimary) return 'connected';
-        return 'unknown';
-    """) or "unknown"
-    logger.debug(f"  Connection status: {status}")
+                const rect = el.getBoundingClientRect();
+                if (rect.top < -10 || rect.top >= 650) continue;
+                if (rect.left >= window.innerWidth * 0.72) continue;
+
+                const text = (el.innerText || el.textContent || '').trim();
+                if (text.length > 40) continue;
+                const textLower = text.toLowerCase();
+                const label = (el.getAttribute('aria-label') || '').toLowerCase();
+
+                if (textLower === 'connect'
+                    || (label.includes('invite') && label.includes('connect')
+                        && !label.includes('disconnect'))) {
+                    hasConnectDirect = true;
+                }
+                if (textLower === 'message' || label.startsWith('message ')) {
+                    hasMessage = true;
+                }
+                if (textLower === 'pending' || label.includes('pending')
+                    || label.includes('withdraw invitation')) {
+                    hasPending = true;
+                }
+                if ((textLower === 'follow' || label.startsWith('follow '))
+                    && !textLower.includes('unfollow')) {
+                    hasFollow = true;
+                }
+            }
+        }
+
+        let status = 'unknown';
+        if (hasPending) status = 'pending';
+        else if (hasConnectDirect) status = 'connect';
+        else if (hasFollow && hasMessage) status = 'connect';  // Connect is inside "More"
+        else if (hasFollow && !hasMessage) status = 'connect';  // follow-first, Connect in More
+        else if (hasMessage && !hasConnectDirect && !hasFollow) status = 'connected';
+
+        return JSON.stringify({
+            status: status,
+            flags: {connect: hasConnectDirect, message: hasMessage, pending: hasPending, follow: hasFollow},
+            buttons: debugBtns
+        });
+    """) or '{"status":"unknown","flags":{},"buttons":[]}'
+
+    try:
+        data = json.loads(result)
+        status = data.get("status", "unknown")
+        flags = data.get("flags", {})
+        btns = data.get("buttons", [])
+        logger.debug(
+            f"  Connection status: {status}  "
+            f"(flags: C={flags.get('connect')}, M={flags.get('message')}, "
+            f"P={flags.get('pending')}, F={flags.get('follow')})  "
+            f"buttons=[{', '.join(btns[:8])}]"
+        )
+    except (json.JSONDecodeError, AttributeError):
+        status = "unknown"
+        logger.debug(f"  Connection status: {status} (raw: {result!r})")
     return status
 
 
-def _click_connect_button(driver: webdriver.Chrome) -> bool:
+def _click_connect_button(driver: webdriver.Chrome, expected_name: str = "") -> bool:
     """
-    Find and click the Connect button on a LinkedIn profile page.
+    Find and click Connect on a profile.
 
-    Real DOM patterns (from debug):
-    - Direct button: <button aria-label="Invite X to connect"> with class
-      artdeco-button--primary, visible near top of page
-    - In More dropdown: <div role="button" aria-label="Invite X to connect">
-      inside artdeco-dropdown__item, after clicking More actions button
-    - "People also viewed" section has Connect buttons too — must NOT click those!
-      They have aria-label "Invite <other person> to connect" but are far down the page.
+    Two strategies (tried in order):
+      1. Direct blue Connect button next to Message (when visible)
+      2. More → Connect dropdown option (follow-first layouts)
+
+    Uses Selenium native find_elements for reliability — JS innerText misses
+    buttons with visually-hidden text spans (common on LinkedIn 2026).
     """
-    # Try 1: Direct Connect button using aria-label (most reliable)
-    # Only click if it's in the top profile actions area (top < 600px)
-    found = driver.execute_script("""
-        const buttons = document.querySelectorAll(
-            'button[aria-label*="Invite"][aria-label*="to connect"]'
-        );
-        for (const btn of buttons) {
-            if (btn.offsetParent !== null) {
-                const rect = btn.getBoundingClientRect();
-                // Only click buttons in the profile header area, not "People also viewed"
-                if (rect.top > 0 && rect.top < 600) {
-                    btn.click();
-                    return 'direct';
-                }
-            }
-        }
-        return null;
-    """)
-
-    if found:
-        logger.debug("  Clicked Connect button directly on profile")
-        return True
-
-    # Try 2: Open "More actions" dropdown, then find Connect inside
-    more_clicked = driver.execute_script("""
-        // LinkedIn has two sets of profile action buttons (sticky header + main).
-        // Match either aria-label variant.
-        const buttons = document.querySelectorAll(
-            'button[aria-label="More actions"], button[aria-label="More"]'
-        );
-        for (const btn of buttons) {
-            if (btn.offsetParent !== null) {
-                const rect = btn.getBoundingClientRect();
-                if (rect.top > 0 && rect.top < 600) {
-                    btn.click();
-                    return true;
-                }
-            }
-        }
-        return false;
-    """)
-
-    if not more_clicked:
-        logger.debug("  No Connect button and no More dropdown found")
-        return False
-
-    # Wait for dropdown to render (LinkedIn animates it in)
     import time
-    for _wait in range(5):
-        time.sleep(0.4)
-        found_in_menu = driver.execute_script("""
-            // Method 1: artdeco-dropdown__item with aria-label (most reliable)
-            const items1 = document.querySelectorAll(
-                '.artdeco-dropdown__item[aria-label*="Invite"][aria-label*="to connect"]'
-            );
-            for (const item of items1) {
-                if (item.offsetParent !== null) {
-                    item.click();
-                    return 'dropdown-item';
-                }
-            }
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.common.by import By as _By
 
-            // Method 2: div[role="button"] with aria-label
-            const items2 = document.querySelectorAll(
-                'div[role="button"][aria-label*="Invite"][aria-label*="to connect"]'
-            );
-            for (const item of items2) {
-                if (item.offsetParent !== null) {
-                    item.click();
-                    return 'role-button';
-                }
-            }
+    # Scroll to top so buttons are in viewport
+    try:
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.5)
+    except Exception:
+        pass
 
-            // Method 3: Any visible dropdown li whose text is exactly "Connect"
-            const lis = document.querySelectorAll(
-                'div.artdeco-dropdown__content li, ul[role="menu"] li'
-            );
-            for (const li of lis) {
-                const text = li.textContent.trim();
-                if (text === 'Connect' && li.offsetParent !== null) {
-                    // Click the inner div/button, not the li itself
-                    const inner = li.querySelector('div[role="button"], button');
-                    if (inner) { inner.click(); return 'li-inner'; }
-                    li.click();
-                    return 'li-text';
-                }
-            }
-
-            return null;
-        """)
-        if found_in_menu:
+    # ── Step 1: Try direct Connect button ────────────────────────────
+    # LinkedIn 2026 renders Connect as <a>, <button>, or [role="button"].
+    # Search all three element types.
+    direct_btn = None
+    try:
+        candidates = driver.find_elements(
+            _By.XPATH,
+            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+            " | //a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+            " | //*[@role='button'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+        )
+        vw = driver.execute_script("return window.innerWidth;")
+        logger.debug(f"  Direct Connect XPath found {len(candidates)} candidates")
+        for idx, btn in enumerate(candidates[:8]):
+            try:
+                _t = (btn.text or "").strip()[:30]
+                _l = (btn.get_attribute("aria-label") or "")[:30]
+                _d = btn.is_displayed()
+                _loc = btn.location
+                _sz = btn.size
+                logger.debug(f"    candidate[{idx}]: tag={btn.tag_name} text='{_t}' label='{_l}' displayed={_d} loc={_loc} size={_sz}")
+            except Exception:
+                pass
+        for btn in candidates:
+            if not btn.is_displayed():
+                continue
+            text = (btn.text or "").strip().lower()
+            label = (btn.get_attribute("aria-label") or "").lower()
+            # Skip negative matches
+            if any(x in text for x in ["disconnect", "connections", "connected"]):
+                continue
+            if any(x in label for x in ["disconnect", "connections", "connected"]):
+                continue
+            # Skip sidebar buttons (right column "More profiles for you")
+            loc = btn.location
+            size = btn.size
+            if loc.get("x", 0) + size.get("width", 0) / 2 >= vw * 0.72:
+                continue
+            # Skip dropdown/menu items
+            try:
+                parent_classes = driver.execute_script(
+                    "return arguments[0].closest("
+                    "'div.artdeco-dropdown__content, [role=\"menu\"],"
+                    " .artdeco-popover__content') !== null;", btn)
+                if parent_classes:
+                    continue
+            except Exception:
+                pass
+            # Must be in the upper portion of the page
+            if loc.get("y", 0) > 650:
+                continue
+            direct_btn = btn
+            logger.debug(f"  Found direct Connect button: text='{text}', label='{label}', "
+                         f"y={loc.get('y')}, x={loc.get('x')}")
             break
+    except Exception as e:
+        logger.debug(f"  Error searching for direct Connect: {e}")
 
-    if found_in_menu:
-        logger.debug(f"  Clicked Connect inside More dropdown (via {found_in_menu})")
+    if direct_btn:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", direct_btn)
+            time.sleep(0.2)
+            ActionChains(driver).move_to_element(direct_btn).pause(0.15).click().perform()
+        except Exception:
+            driver.execute_script("arguments[0].click();", direct_btn)
+        logger.debug("  Clicked direct Connect button via ActionChains")
         return True
 
-    logger.debug("  Connect not found in More dropdown either")
+    # ── Step 2: No direct Connect — try More → Connect ───────────────
+    more_btn = None
+    try:
+        # Find the profile-section More button (not the navbar one)
+        candidates = driver.find_elements(
+            _By.XPATH,
+            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            " 'abcdefghijklmnopqrstuvwxyz'), 'more')]"
+            " | //button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            " 'abcdefghijklmnopqrstuvwxyz'), 'more actions')]"
+        )
+        for btn in candidates:
+            if not btn.is_displayed():
+                continue
+            text = (btn.text or "").strip().lower()
+            label = (btn.get_attribute("aria-label") or "").lower()
+            # Skip "Learn more", "Show more", etc.
+            if any(x in text for x in ["learn", "show", "see", "load"]):
+                continue
+            # Must be "more" or "more actions" specifically
+            if text not in ("more", "") and label not in ("more actions", "more", "more options"):
+                continue
+            loc = btn.location
+            if loc.get("y", 0) > 650 or loc.get("y", 0) < 0:
+                continue
+            vw = driver.execute_script("return window.innerWidth;")
+            if loc.get("x", 0) >= vw * 0.72:
+                continue
+            more_btn = btn
+            break
+    except Exception as e:
+        logger.debug(f"  Error searching for More button: {e}")
+
+    if more_btn:
+        # Click More with real mouse events
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", more_btn)
+            time.sleep(0.2)
+            ActionChains(driver).move_to_element(more_btn).pause(0.15).click().perform()
+            logger.debug("  Clicked More actions button via ActionChains")
+        except Exception as e:
+            logger.debug(f"  ActionChains click on More failed: {e}, trying JS")
+            driver.execute_script("arguments[0].click();", more_btn)
+
+        # Wait for dropdown and find Connect option using Selenium native
+        connect_in_menu = None
+        for attempt in range(12):
+            time.sleep(0.35)
+            try:
+                # Search for Connect-like items in the dropdown
+                menu_items = driver.find_elements(
+                    _By.XPATH,
+                    "//*[@role='menu']//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+                    " | //*[@role='menu']//*[@role='menuitem'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+                    " | //*[contains(@class,'artdeco-dropdown')]//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+                    " | //*[contains(@class,'artdeco-dropdown')]//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    " 'abcdefghijklmnopqrstuvwxyz'), 'connect')]"
+                )
+                for item in menu_items:
+                    if not item.is_displayed():
+                        continue
+                    text = (item.text or "").strip().lower()
+                    label = (item.get_attribute("aria-label") or "").lower()
+                    # Skip destructive actions
+                    if any(x in text + label for x in [
+                        "disconnect", "connections", "connected",
+                        "remove", "block", "report", "unfollow"
+                    ]):
+                        continue
+                    connect_in_menu = item
+                    break
+            except Exception:
+                pass
+
+            if connect_in_menu:
+                try:
+                    ActionChains(driver).move_to_element(connect_in_menu).pause(0.15).click().perform()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", connect_in_menu)
+                logger.debug("  Clicked Connect inside More dropdown via ActionChains")
+                return True
+
+        logger.debug("  More button found but no Connect option in dropdown")
+        # Close the dropdown before giving up
+        try:
+            driver.execute_script("""
+                document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+            """)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    logger.debug("  Connect not found via direct button or More->Connect")
     return False
 
 
 def _click_send_button(driver: webdriver.Chrome) -> bool:
     """Find and click the Send / Send invitation button in the connection modal."""
     import time
+    from selenium.webdriver.common.action_chains import ActionChains as _AC
+    from selenium.webdriver.common.by import By as _By
 
     human_delay(0.5, 1)
 
-    # First, log what buttons exist in the modal so we can debug
-    debug_info = driver.execute_script("""
-        const modal = document.querySelector(
-            'div.artdeco-modal, div.send-invite, div[role="dialog"]'
-        );
-        const scope = modal || document;
-        const btns = scope.querySelectorAll('button');
-        const info = [];
-        for (const btn of btns) {
-            if (btn.offsetParent !== null) {
-                info.push({
-                    text: btn.textContent.trim().substring(0, 60),
-                    label: btn.getAttribute('aria-label') || '',
-                    disabled: btn.disabled,
-                    classes: btn.className.substring(0, 80)
-                });
-            }
-        }
-        return JSON.stringify(info);
-    """)
-    logger.debug(f"  Modal buttons: {debug_info}")
+    send_texts = [
+        "send",
+        "send invitation",
+        "send now",
+        "send without a note",
+        "send without note",
+    ]
 
-    # Wait up to 3 seconds for Send button to become enabled
-    # (LinkedIn sometimes keeps it disabled briefly after typing)
     send_btn = None
-    for attempt in range(6):
+
+    for attempt in range(10):
+        # --- Shadow DOM search first ---
         send_btn = driver.execute_script("""
-            const buttons = document.querySelectorAll('button');
-
-            // Priority 1: aria-label match
-            for (const btn of buttons) {
-                const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                if ((label.includes('send invitation') || label.includes('send now'))
-                    && btn.offsetParent !== null && !btn.disabled) {
-                    return btn;
+            const targets = arguments[0];
+            const allEls = document.querySelectorAll('*');
+            let best = null, bestScore = -999;
+            for (const el of allEls) {
+                if (!el.shadowRoot) continue;
+                const btns = el.shadowRoot.querySelectorAll('button, a, [role="button"]');
+                for (const btn of btns) {
+                    const r = btn.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) continue;
+                    const text = (btn.innerText || '').trim().toLowerCase();
+                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    const blob = label + ' ' + text;
+                    let isSend = false;
+                    for (const t of targets) {
+                        if (text === t || label.startsWith(t) || blob.includes(t)) { isSend = true; break; }
+                    }
+                    if (!isSend) continue;
+                    let score = 0;
+                    const cls = (btn.getAttribute('class') || '').toLowerCase();
+                    if (cls.includes('primary')) score += 4;
+                    if (blob.includes('send invitation')) score += 4;
+                    else if (blob.includes('send now')) score += 3;
+                    else if (text === 'send') score += 2;
+                    if (r.y > 80) score += 2;
+                    if (score > bestScore) { bestScore = score; best = btn; }
                 }
             }
-
-            // Priority 2: exact text match on innerText (ignores child spans)
-            for (const btn of buttons) {
-                const text = btn.innerText.trim().toLowerCase();
-                if ((text === 'send' || text === 'send invitation'
-                     || text === 'send now')
-                    && btn.offsetParent !== null && !btn.disabled) {
-                    return btn;
-                }
-            }
-
-            // Priority 3: partial text match (e.g., "Send" inside longer text)
-            for (const btn of buttons) {
-                const text = btn.innerText.trim().toLowerCase();
-                if (text.startsWith('send') && !text.includes('without')
-                    && btn.offsetParent !== null && !btn.disabled) {
-                    return btn;
-                }
-            }
-
-            return null;
-        """)
+            return best;
+        """, send_texts)
         if send_btn:
+            logger.debug(f"  Found Send button in shadow DOM on attempt {attempt + 1}")
             break
-        time.sleep(0.5)
 
-    if not send_btn:
-        # Last resort: find even if disabled, and click anyway
-        send_btn = driver.execute_script("""
-            const buttons = document.querySelectorAll('button');
-            for (const btn of buttons) {
-                const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                const text = btn.innerText.trim().toLowerCase();
-                if ((label.includes('send invitation') || label.includes('send now')
-                     || text === 'send' || text === 'send invitation')
-                    && btn.offsetParent !== null) {
-                    return btn;
-                }
-            }
-            return null;
-        """)
+        # --- Regular DOM fallback ---
+        try:
+            all_buttons = driver.find_elements(
+                _By.XPATH, "//button | //a | //*[@role='button']"
+            )
+            best = None
+            best_score = -999
+            for btn in all_buttons:
+                if not btn.is_displayed() or not btn.is_enabled():
+                    continue
+                text = (btn.text or "").strip().lower()
+                label = (btn.get_attribute("aria-label") or "").lower()
+                blob = f"{label} {text}"
+
+                is_send = any(
+                    text == t or label.startswith(t) or t in blob
+                    for t in send_texts
+                )
+                if not is_send:
+                    continue
+
+                score = 0
+                cls = (btn.get_attribute("class") or "").lower()
+                if "artdeco-button--primary" in cls:
+                    score += 4
+                if "send invitation" in blob:
+                    score += 4
+                elif "send now" in blob:
+                    score += 3
+                elif text == "send":
+                    score += 2
+
+                loc = btn.location
+                if loc.get("y", 0) > 80:
+                    score += 2
+
+                if score > best_score:
+                    best_score = score
+                    best = btn
+
+            if best and best_score >= 2:
+                send_btn = best
+                logger.debug(f"  Found Send button in regular DOM on attempt {attempt + 1}")
+                break
+        except Exception:
+            pass
+
+        time.sleep(0.4)
 
     if not send_btn:
         logger.debug("  Could not find Send button at all")
         return False
 
-    # Try ActionChains mouse-move + click first (most human-like)
+    # Try JS click first for shadow DOM elements (ActionChains may not work)
+    try:
+        driver.execute_script("arguments[0].click();", send_btn)
+        logger.debug("  Clicked Send via JS click")
+        human_delay(2, 3)
+        return True
+    except Exception as e:
+        logger.debug(f"  JS click failed: {e}")
+
+    # Fallback: ActionChains
     from utils import human_move_and_click
     if human_move_and_click(driver, send_btn):
         logger.debug("  Clicked Send via ActionChains mouse-move + click")
@@ -1681,16 +2122,127 @@ def _click_send_button(driver: webdriver.Chrome) -> bool:
         human_delay(2, 3)
         return True
     except Exception as e:
-        logger.debug(f"  Selenium click failed: {e}, trying JS click")
+        logger.debug(f"  All click methods failed: {e}")
+        return False
 
-    # Fallback: JS click
+
+def _click_secondary_connect_option(driver: webdriver.Chrome) -> bool:
+    """Click a visible secondary Connect option from an open popover/menu.
+
+    Some profile UIs show an intermediate action sheet after the first Connect
+    click. This helper clicks the final visible Connect item when present.
+    Uses ActionChains for real mouse events.
+    """
+    from selenium.webdriver.common.action_chains import ActionChains as _AC
     try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", send_btn)
-        logger.debug("  Clicked Send via JS click")
-        human_delay(2, 3)
-        return True
-    except Exception as e:
-        logger.debug(f"  JS click also failed: {e}")
+        elem = driver.execute_script("""
+            const scopes = document.querySelectorAll(
+                'div.artdeco-dropdown__content, [role="menu"], ul[role="menu"], '
+                + '.artdeco-popover__content, div[role="dialog"]'
+            );
+
+            for (const scope of scopes) {
+                if (!scope || scope.offsetParent === null) continue;
+                const rect = scope.getBoundingClientRect();
+                if (rect.top > window.innerHeight || rect.bottom < 0) continue;
+
+                const entries = scope.querySelectorAll(
+                    'button, div[role="button"], a[role="button"], span[role="button"], li, '
+                    + 'div[role="menuitem"], a[role="menuitem"]'
+                );
+
+                for (const entry of entries) {
+                    if (!entry || entry.offsetParent === null) continue;
+                    const text = (entry.innerText || entry.textContent || '').trim().toLowerCase();
+                    const label = (entry.getAttribute('aria-label') || '').toLowerCase();
+                    const blob = `${label} ${text}`;
+
+                    if (blob.includes('remove connection') || blob.includes('disconnect') || blob.includes('unfollow')) {
+                        continue;
+                    }
+
+                    const isConnect = (
+                        (label.includes('invite') && label.includes('connect'))
+                        || text === 'connect'
+                        || text.startsWith('connect')
+                        || (text.includes('invite') && text.includes('connect'))
+                    );
+                    if (!isConnect) continue;
+
+                    const clickable = entry.matches('button, div[role="button"], a[role="button"], span[role="button"]')
+                        ? entry
+                        : (entry.querySelector('button, div[role="button"], a[role="button"], span[role="button"]') || entry);
+                    return clickable;
+                }
+            }
+            return null;
+        """)
+        if elem:
+            try:
+                _AC(driver).move_to_element(elem).pause(0.15).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", elem)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_invite_pending(driver: webdriver.Chrome) -> bool:
+    """Return True if profile UI indicates an invite was already sent/pending.
+    
+    IMPORTANT: Only checks for Pending as a PRIMARY action button in the 
+    profile header area (where Connect button was). Does NOT match Pending
+    text in dropdown menus, "Connect if you know each other" sections, or
+    other parts of the page.
+    """
+    try:
+        return bool(driver.execute_script("""
+            // Only check primary action buttons in the profile header area
+            // (typically top 500px, left 72% of viewport)
+            const elems = document.querySelectorAll('button, [role="button"]');
+            for (const el of elems) {
+                if (!el || el.offsetParent === null) continue;
+                if (el.closest('aside, nav')) continue;
+                // Skip dropdown menus 
+                if (el.closest('div.artdeco-dropdown__content, [role="menu"], ul[role="menu"], '
+                    + '.artdeco-popover__content, div[class*="dropdown"]')) continue;
+                // Skip "Connect if you know each other" section and similar
+                if (el.closest('section, div[class*="pymk"], div[class*="highlight"]')) {
+                    // But don't skip the main profile header section
+                    const section = el.closest('section');
+                    if (section) {
+                        const headingText = (section.querySelector('h2, h3') || {}).textContent || '';
+                        if (headingText.toLowerCase().includes('connect if')
+                            || headingText.toLowerCase().includes('highlight')
+                            || headingText.toLowerCase().includes('people')
+                            || headingText.toLowerCase().includes('similar')) continue;
+                    }
+                }
+                const rect = el.getBoundingClientRect();
+                // Only check buttons in the profile header action area (narrow range)
+                if (rect.top < -10 || rect.top >= 500) continue;
+                if (rect.left >= window.innerWidth * 0.72) continue;
+
+                const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+
+                if (text === 'pending') return true;
+                if (label.includes('withdraw invitation')) return true;
+            }
+
+            // Toast confirmation fallback
+            const toasts = document.querySelectorAll('[role="alert"], .artdeco-toast-item, div[class*="toast"]');
+            for (const toast of toasts) {
+                if (!toast) continue;
+                const t = (toast.innerText || toast.textContent || '').toLowerCase();
+                if (t.includes('invitation sent') || t.includes('request sent')
+                    || t.includes('invite sent') || t.includes('connection sent')) return true;
+            }
+
+            return false;
+        """))
+    except Exception:
         return False
 
 
