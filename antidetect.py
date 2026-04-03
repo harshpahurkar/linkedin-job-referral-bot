@@ -520,16 +520,16 @@ def realistic_profile_reading(driver: webdriver.Chrome):
             "return (document.body.innerText || '').length;"
         ) or 1000
 
-        # Reading time: 1s per ~300 chars, clamped to 3-8s
-        read_time = max(3.0, min(8.0, content_len / 300.0))
+        # Reading time: 1s per ~400 chars, clamped to 2-6s
+        read_time = max(2.0, min(6.0, content_len / 400.0))
         read_time *= get_session().fatigue_multiplier
 
         # Phase 1: Initial scan — look at name, headline, photo
         bezier_mouse_move(driver, random.randint(300, 600), random.randint(80, 200))
-        time.sleep(random.uniform(0.6, 1.5))
+        time.sleep(random.uniform(0.4, 1.0))
 
         # Phase 2: Scroll down to read experience/about
-        scroll_segments = random.randint(2, 3)
+        scroll_segments = random.randint(1, 2)
         for seg in range(scroll_segments):
             # Variable scroll distance
             dist = random.randint(200, 500)
@@ -564,14 +564,39 @@ def realistic_profile_reading(driver: webdriver.Chrome):
         time.sleep(random.uniform(3, 6))
 
 
+def _send_chunk(element, chunk: str, fatigue: float = 1.0):
+    """Send a text chunk, routing non-BMP chars (emoji) through JS."""
+    bmp = []
+    for ch in chunk:
+        if ord(ch) > 0xFFFF:
+            # Flush any accumulated BMP chars first
+            if bmp:
+                element.send_keys(''.join(bmp))
+                bmp.clear()
+            # Inject non-BMP char via JS (ChromeDriver can't send_keys these)
+            element.parent.execute_script(
+                "var el = arguments[0], v = arguments[1];"
+                "if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){"
+                "  el.value += v;"
+                "} else {"
+                "  el.textContent += v;"
+                "}"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));",
+                element, ch,
+            )
+            time.sleep(random.uniform(0.05, 0.12) * fatigue)
+        else:
+            bmp.append(ch)
+    if bmp:
+        element.send_keys(''.join(bmp))
+
+
 def realistic_typing(element, text: str):
     """Type text with human-realistic patterns.
 
-    Improvements over the old _type_message:
-      - Variable typing speed (fast for common words, slow for complex)
-      - Occasional pause between words (thinking)
-      - Rare typo + backspace correction (2% chance per word)
-      - Speed varies within a session (fatigue)
+    Types in short bursts (2-5 chars) instead of single characters
+    for speed, with thinking pauses between words and occasional
+    typo + backspace correction.
     """
     fatigue = get_session().fatigue_multiplier
     words = text.split(' ')
@@ -579,34 +604,37 @@ def realistic_typing(element, text: str):
     for word_idx, word in enumerate(words):
         # Add space between words (except first)
         if word_idx > 0:
-            element.send_keys(' ')
-            # 15% chance of a thinking pause between words
-            if random.random() < 0.15:
-                time.sleep(random.uniform(0.3, 1.2) * fatigue)
+            _send_chunk(element, ' ', fatigue)
+            # 12% chance of a thinking pause between words
+            if random.random() < 0.12:
+                time.sleep(random.uniform(0.2, 0.8) * fatigue)
             else:
-                time.sleep(random.uniform(0.05, 0.15))
+                time.sleep(random.uniform(0.03, 0.10))
 
         # 2% chance of making a typo and correcting it
         if random.random() < 0.02 and len(word) > 3:
-            # Type most of the word, add wrong char, backspace, fix
             cutoff = random.randint(2, len(word) - 1)
-            for char in word[:cutoff]:
-                _type_char(element, char, fatigue)
-            # Wrong character
+            _send_chunk(element, word[:cutoff], fatigue)
+            time.sleep(random.uniform(0.04, 0.08) * fatigue)
             wrong = chr(random.randint(97, 122))
-            _type_char(element, wrong, fatigue)
-            time.sleep(random.uniform(0.2, 0.6))  # notice the mistake
+            _send_chunk(element, wrong, fatigue)
+            time.sleep(random.uniform(0.15, 0.4))
             element.send_keys('\ue003')  # backspace
-            time.sleep(random.uniform(0.1, 0.3))
-            # Continue with correct chars
-            for char in word[cutoff:]:
-                _type_char(element, char, fatigue)
+            time.sleep(random.uniform(0.08, 0.2))
+            _send_chunk(element, word[cutoff:], fatigue)
+            time.sleep(random.uniform(0.03, 0.08) * fatigue)
         else:
-            for char in word:
-                _type_char(element, char, fatigue)
+            # Type in bursts of 2-5 chars
+            i = 0
+            while i < len(word):
+                chunk = random.randint(2, 5)
+                _send_chunk(element, word[i:i + chunk], fatigue)
+                i += chunk
+                if i < len(word):
+                    time.sleep(random.uniform(0.02, 0.07) * fatigue)
 
-    # Small pause after finishing typing (reviewing what was written)
-    time.sleep(random.uniform(0.5, 1.5))
+    # Small pause after finishing typing
+    time.sleep(random.uniform(0.3, 0.8))
 
 
 def _type_char(element, char: str, fatigue: float = 1.0):
@@ -690,7 +718,7 @@ def simulate_natural_break(driver: webdriver.Chrome):
     This takes 30s–3min and makes the session look organic.
     """
     session = get_session()
-    duration = random.uniform(15, 50) * session.fatigue_multiplier
+    duration = random.uniform(10, 30) * session.fatigue_multiplier
 
     roll = random.random()
 

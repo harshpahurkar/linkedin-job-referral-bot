@@ -1210,8 +1210,8 @@ def _send_connection_with_note(
             logger.info(f"  🔗 Already connected to {contact.name} — sending DM")
             return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
         if status == "pending":
-            logger.debug(f"  Connection already pending for {contact.name}, trying DM")
-            return "dm_sent" if _send_direct_message(driver, contact, message) else "failed"
+            logger.debug(f"  Connection already pending for {contact.name}, skipping")
+            return "failed"
 
         # Step 1: Find and click the Connect button (direct or inside "More")
         clicked = _click_connect_button(driver, expected_name=contact.name)
@@ -1259,7 +1259,7 @@ def _send_connection_with_note(
         from selenium.webdriver.common.by import By as _By
 
         # Give the modal time to animate in
-        _time.sleep(2.0)
+        _time.sleep(1.2)
 
         # LinkedIn 2026 renders the invitation modal inside a Shadow DOM
         # (host: div.theme--light).  Regular querySelectorAll and Selenium
@@ -1310,6 +1310,11 @@ def _send_connection_with_note(
                 const allEls = document.querySelectorAll('*');
                 for (const el of allEls) {
                     if (!el.shadowRoot) continue;
+                    // Only look in shadow roots that contain invitation-related text
+                    // (skip the messaging overlay widget)
+                    const rootText = (el.shadowRoot.textContent || '').toLowerCase();
+                    if (!rootText.includes('add a note') && !rootText.includes('invitation')
+                        && !rootText.includes('how do you know') && !rootText.includes('connect')) continue;
                     // textarea
                     const tas = el.shadowRoot.querySelectorAll('textarea');
                     for (const ta of tas) {
@@ -1348,7 +1353,7 @@ def _send_connection_with_note(
 
         # Step 2: Find and click "Add a note" button
         add_note_btn = None
-        for attempt in range(10):
+        for attempt in range(5):
             # Try shadow DOM first (LinkedIn 2026 standard)
             add_note_btn = _find_shadow_modal_btn(driver, "add a note")
             if add_note_btn:
@@ -1394,7 +1399,7 @@ def _send_connection_with_note(
         # Step 3: Find the textarea and type the message
         # Search shadow DOM first, then regular DOM.
         note_field = None
-        for _ in range(10):
+        for _ in range(5):
             # Shadow DOM textarea/contenteditable
             note_field = _find_shadow_textarea(driver)
             if note_field:
@@ -1858,6 +1863,11 @@ def _click_connect_button(driver: webdriver.Chrome, expected_name: str = "") -> 
                 continue
             if any(x in label for x in ["disconnect", "connections", "connected"]):
                 continue
+            # Must be a real Connect button, not a "mutual connection" link.
+            # Real buttons: text="Connect" (short), label="Invite X to connect"
+            # False positives: "Neel, Ihor and 1 other mutual connection" (long)
+            if len(text) > 15 and "invite" not in label:
+                continue
             # Skip sidebar buttons (right column "More profiles for you")
             loc = btn.location
             size = btn.size
@@ -2010,7 +2020,7 @@ def _click_send_button(driver: webdriver.Chrome) -> bool:
 
     send_btn = None
 
-    for attempt in range(10):
+    for attempt in range(5):
         # --- Shadow DOM search first ---
         send_btn = driver.execute_script("""
             const targets = arguments[0];

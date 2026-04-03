@@ -49,8 +49,8 @@ class Config:
     # and never got a single warning.  We got greedy → LinkedIn noticed.
     # Rule: it's ALWAYS better to send fewer, higher-quality referrals
     # than to blast 200/day and get restricted.
-    DAILY_TARGET_MIN: int = int(os.getenv("DAILY_TARGET_MIN", "35"))
-    DAILY_TARGET_MAX: int = int(os.getenv("DAILY_TARGET_MAX", "55"))
+    DAILY_TARGET_MIN: int = int(os.getenv("DAILY_TARGET_MIN", "25"))
+    DAILY_TARGET_MAX: int = int(os.getenv("DAILY_TARGET_MAX", "40"))
     MAX_MESSAGES_PER_DAY: int = DAILY_TARGET_MAX   # overridden at runtime
     # 3 per company keeps it realistic — nobody cold-messages 5 strangers
     # at the same company in one sitting.
@@ -59,14 +59,14 @@ class Config:
     # protection (fatigue, velocity throttle, breaks, browse-without-acting,
     # feed engagement, page variety, skip days) so the per-send delay
     # just needs to look natural, not be the primary safety lever.
-    MESSAGE_DELAY_MIN: int = int(os.getenv("MESSAGE_DELAY_MIN", "30"))
-    MESSAGE_DELAY_MAX: int = int(os.getenv("MESSAGE_DELAY_MAX", "75"))
+    MESSAGE_DELAY_MIN: int = int(os.getenv("MESSAGE_DELAY_MIN", "20"))
+    MESSAGE_DELAY_MAX: int = int(os.getenv("MESSAGE_DELAY_MAX", "50"))
 
     # ── Weekly Safety Limits (LinkedIn monitors these) ────────────────
     # LinkedIn's actual weekly connection limit is ~100-200 depending on
     # account age, network size, and Premium status.  We stay well under.
     # After the warning: cut everything roughly in HALF from the old limits.
-    MAX_PROFILE_VIEWS_PER_WEEK: int = int(os.getenv("MAX_PROFILE_VIEWS_PER_WEEK", "600"))
+    MAX_PROFILE_VIEWS_PER_WEEK: int = int(os.getenv("MAX_PROFILE_VIEWS_PER_WEEK", "800"))
     MAX_CONNECTIONS_PER_WEEK: int = int(os.getenv("MAX_CONNECTIONS_PER_WEEK", "200"))
 
     # ── Contact Filtering ─────────────────────────────────────────────
