@@ -99,7 +99,10 @@ def find_and_message_employees(
         f"connections, {weekly_profiles}/{Config.MAX_PROFILE_VIEWS_PER_WEEK} profile views"
     )
 
+    weekly_limit_hit = False
     for job in jobs:
+        if weekly_limit_hit:
+            break
         if total_sent >= Config.MAX_MESSAGES_PER_DAY:
             logger.info(f"🛑 Daily message limit reached ({Config.MAX_MESSAGES_PER_DAY}).")
             break
@@ -199,6 +202,10 @@ def find_and_message_employees(
             message = _pick_message(contact, job)
 
             result = _send_connection_with_note(driver, contact, message)
+            if result == "weekly_limit":
+                logger.critical("🛑 Weekly invitation limit hit — stopping all outreach!")
+                weekly_limit_hit = True
+                break
             if result in ("connection_sent", "dm_sent"):
                 db.mark_messaged(contact.contact_id)
                 db.mark_referral_requested(job.job_id)
@@ -1478,6 +1485,10 @@ def _send_connection_with_note(
 
         # Step 4: Click Send
         if _click_send_button(driver):
+            # Check for weekly invitation limit message
+            if _check_weekly_limit_message(driver):
+                logger.critical("🛑 LinkedIn weekly invitation limit reached!")
+                return "weekly_limit"
             return "connection_sent"
         if _is_invite_pending(driver):
             logger.debug("  Send button not found, but Pending state detected after note flow")
@@ -2194,6 +2205,31 @@ def _click_secondary_connect_option(driver: webdriver.Chrome) -> bool:
                 driver.execute_script("arguments[0].click();", elem)
             return True
         return False
+    except Exception:
+        return False
+
+
+def _check_weekly_limit_message(driver: webdriver.Chrome) -> bool:
+    """Check if LinkedIn is showing the weekly connection invitation limit message.
+
+    Searches both regular DOM and shadow DOM for text like:
+    'reached the weekly limit for connection invitations'
+    """
+    try:
+        return bool(driver.execute_script("""
+            const needle = 'weekly limit';
+            // Check regular DOM
+            const body = (document.body.innerText || '').toLowerCase();
+            if (body.includes(needle) && body.includes('invitation')) return true;
+            // Check shadow DOM
+            const allEls = document.querySelectorAll('*');
+            for (const el of allEls) {
+                if (!el.shadowRoot) continue;
+                const text = (el.shadowRoot.textContent || '').toLowerCase();
+                if (text.includes(needle) && text.includes('invitation')) return true;
+            }
+            return false;
+        """))
     except Exception:
         return False
 
