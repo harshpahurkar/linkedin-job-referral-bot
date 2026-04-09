@@ -200,6 +200,59 @@ class Config:
     # ── Logging ───────────────────────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # ── Email Outreach ────────────────────────────────────────────────
+    # After a LinkedIn connection request, the bot discovers the contact's
+    # corporate email and sends a short follow-up email the next day.
+    # Uses Gmail SMTP with an App Password (enable 2FA on Google, then
+    # generate an App Password at myaccount.google.com/apppasswords).
+    EMAIL_ENABLED: bool = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
+    EMAIL_ADDRESS: str = os.getenv("EMAIL_ADDRESS", "")
+    EMAIL_APP_PASSWORD: str = os.getenv("EMAIL_APP_PASSWORD", "")
+    EMAIL_DAILY_LIMIT: int = int(os.getenv("EMAIL_DAILY_LIMIT", "10"))
+    EMAIL_WEEKLY_LIMIT: int = int(os.getenv("EMAIL_WEEKLY_LIMIT", "50"))
+    # Days to wait after LinkedIn touch before sending email
+    EMAIL_DELAY_AFTER_LINKEDIN: int = int(os.getenv("EMAIL_DELAY_AFTER_LINKEDIN", "1"))
+
+    # Email templates — plain text, short, professional.
+    # Placeholders: {first_name}, {job_title}, {company}, {tech_snippet},
+    #               {your_name}, {school}
+    # Format: first line = "Subject: ..." then blank line then body.
+    EMAIL_TEMPLATES: list[str] = [
+        # E0 — Standard follow-up
+        "Subject: Quick note \u2014 {job_title} application\n\n"
+        "Hi {first_name},\n\n"
+        "I recently applied for the {job_title} role at {company} "
+        "and wanted to reach out directly.\n\n"
+        "Quick background: I'm a software developer with Canadian "
+        "co-op experience (Ontario Ministry) and hands-on work with "
+        "{tech_snippet}. I've built and shipped production systems "
+        "end-to-end.\n\n"
+        "Would love to connect or learn more about the team. Happy "
+        "to share my portfolio if that'd be helpful.\n\n"
+        "Best,\n{your_name}",
+
+        # E1 — Shorter variant
+        "Subject: {job_title} at {company} \u2014 applied + wanted to connect\n\n"
+        "Hi {first_name},\n\n"
+        "Applied for the {job_title} position and wanted to put a "
+        "face to the application. I've worked with {tech_snippet} in "
+        "production and have Canadian co-op experience.\n\n"
+        "Would appreciate any insight into the role or team. No "
+        "pressure at all.\n\n"
+        "Best,\n{your_name}",
+
+        # E2 — Recruiter/HR specific
+        "Subject: {job_title} \u2014 applied via portal, reaching out directly\n\n"
+        "Hi {first_name},\n\n"
+        "I submitted my application for the {job_title} role at "
+        "{company} and wanted to connect directly. I have Canadian "
+        "co-op experience (Ontario Ministry) and production experience "
+        "with {tech_snippet}.\n\n"
+        "Happy to send over my portfolio or jump on a quick call "
+        "whenever works for you.\n\n"
+        "Best,\n{your_name}",
+    ]
+
     # ── Message Templates ─────────────────────────────────────────────
     # LinkedIn limits connection notes to 300 characters.
     # Strategy: Direct but human. Mention the role, ask clearly, stay short.
@@ -267,10 +320,10 @@ class Config:
 
         # T7 — Recruiter / talent-specific, JD tech
         "Hi {first_name}, saw you handle talent at {company},"
-        " I've been building production systems with"
-        " {tech_snippet}. The {job_title} role is a great fit."
-        " Market's been tough, would love a shot at getting"
-        " referred \U0001f64f {your_name}",
+        " I applied for the {job_title} role and wanted to"
+        " connect directly. I've shipped production systems"
+        " with {tech_snippet}. Would love a chance to chat"
+        " about the role \U0001f64f {your_name}",
     ]
 
     # Legacy single-template fallback (kept for backward compat)

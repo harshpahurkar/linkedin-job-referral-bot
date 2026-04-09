@@ -22,6 +22,7 @@ from auth import login
 from scraper import scrape_jobs, scrape_jobs_by_window
 from messenger import find_and_message_employees
 from scheduler import start_scheduler
+from email_outreach import send_pending_emails
 from antidetect import (
     reset_session, get_session, is_session_safe,
     check_for_linkedin_warnings, simulate_natural_break,
@@ -275,6 +276,15 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
             daily_target = remaining_weekly
             Config.MAX_MESSAGES_PER_DAY = daily_target
             logger.info(f"⚠️  Capped to {daily_target} to stay under weekly limit.")
+
+        # ── Email follow-up pass (runs before browser, no Selenium needed) ──
+        if Config.EMAIL_ENABLED and not dry_run:
+            try:
+                emails_sent = send_pending_emails(db)
+                if emails_sent:
+                    logger.info(f"📧 Email pass complete: {emails_sent} follow-up emails sent")
+            except Exception as e:
+                logger.warning(f"Email follow-up pass failed (non-critical): {e}")
 
         # 2. Clear old jobs for a fresh scrape each run
         db.clear_jobs()

@@ -24,6 +24,7 @@ from selenium.common.exceptions import (
 
 from config import Config
 from models import Job, Contact, Database
+from email_outreach import discover_email
 from utils import (
     get_logger, human_delay, long_delay, scroll_page,
     human_move_and_click, simulate_random_mouse_movement,
@@ -152,8 +153,6 @@ def find_and_message_employees(
         contacts.sort(key=_score_contact, reverse=True)
 
         sent_at_company = 0
-        consecutive_failures = 0
-        _MAX_CONSECUTIVE_FAILURES = 3
         for contact in contacts:
             if total_sent >= Config.MAX_MESSAGES_PER_DAY:
                 break
@@ -161,9 +160,6 @@ def find_and_message_employees(
                 break
             if sent_at_company >= Config.MAX_MESSAGES_PER_COMPANY:
                 logger.debug(f"  → Hit per-company limit ({Config.MAX_MESSAGES_PER_COMPANY}) for {company}, moving on.")
-                break
-            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                logger.info(f"  → {_MAX_CONSECUTIVE_FAILURES} consecutive failures at {company}, moving on.")
                 break
 
             # Skip if already messaged
@@ -206,6 +202,9 @@ def find_and_message_employees(
                 logger.critical("🛑 Weekly invitation limit hit — stopping all outreach!")
                 weekly_limit_hit = True
                 break
+            if result == "contract_skip":
+                logger.debug(f"  → {contact.name} is contract, trying next contact")
+                continue
             if result in ("connection_sent", "dm_sent"):
                 db.mark_messaged(contact.contact_id)
                 db.mark_referral_requested(job.job_id)
@@ -218,8 +217,18 @@ def find_and_message_employees(
                     get_session().record_dm()
                 total_sent += 1
                 sent_at_company += 1
-                consecutive_failures = 0  # reset on success
                 logger.info(f"  ✉️  Sent referral request to {contact.name} ({company})")
+
+                # ── Email discovery (for next-day follow-up) ─────────
+                if Config.EMAIL_ENABLED:
+                    try:
+                        db.set_contact_job_id(contact.contact_id, job.job_id)
+                        email = discover_email(contact)
+                        if email:
+                            db.set_contact_email(contact.contact_id, email)
+                            logger.debug(f"  📧 Discovered email: {email}")
+                    except Exception as e:
+                        logger.debug(f"  Email discovery failed: {e}")
 
                 # ── Anti-detection: fatigue-aware delay after send ──
                 # Uses session velocity + fatigue multiplier for
@@ -234,9 +243,9 @@ def find_and_message_employees(
                 warning, _ = check_for_linkedin_warnings(driver)
                 if warning:
                     logger.critical("🛑 Warning after send — stopping immediately!")
+                    weekly_limit_hit = True  # reuse flag to break outer loop too
                     break
             else:
-                consecutive_failures += 1
                 logger.warning(f"  ⚠️  Could not message {contact.name}")
                 human_delay(1, 2)
 
@@ -1188,6 +1197,107 @@ def _search_company_employees(
     return contacts
 
 
+def _scroll_profile_main(driver: webdriver.Chrome):
+    """Scroll the LinkedIn ``<main>`` container to force-load all sections.
+
+    LinkedIn renders profiles inside ``<main id="workspace">`` with
+    ``overflow: scroll``.  ``window.scrollTo`` does nothing — we must
+    scroll this container directly.  Each step pauses briefly so
+    lazy-loaded sections (Experience, Education, …) actually render.
+    """
+    import time as _t
+    try:
+        scroll_height = driver.execute_script("""
+            const m = document.querySelector('main#workspace, main');
+            if (!m) return 0;
+            return m.scrollHeight;
+        """) or 0
+        if scroll_height < 200:
+            return  # no scrollable main container
+
+        # Scroll down in steps
+        for y in range(0, scroll_height, 400):
+            driver.execute_script(f"""
+                const m = document.querySelector('main#workspace, main');
+                if (m) m.scrollTop = {y};
+            """)
+            _t.sleep(0.3)
+
+        _t.sleep(0.5)  # let last lazy-loaded content render
+
+        # Scroll back to top
+        driver.execute_script("""
+            const m = document.querySelector('main#workspace, main');
+            if (m) m.scrollTop = 0;
+        """)
+        _t.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _is_contract_employee(driver: webdriver.Chrome) -> bool:
+    """Check if the current profile's FIRST experience entry is contract/non-FT.
+
+    LinkedIn renders profiles inside ``<main id="workspace">`` with
+    ``overflow: scroll``.  We must scroll **that** container (not the
+    window) to force-load the Experience section, then inspect the
+    first company block for employment-type text like
+    ``"Contract Full-time · 2 yrs"`` or ``"Part-time · 6 mos"``.
+    """
+    try:
+        # Step 1: scroll the main container to load Experience section
+        _scroll_profile_main(driver)
+
+        # Step 2: detect employment type via JS
+        employment_type = driver.execute_script(r"""
+            // ── Find the Experience heading ─────────────────────
+            let expHeading = null;
+            for (const h of document.querySelectorAll('h2, h3')) {
+                if (/^\s*Experience\s*$/i.test(h.textContent)) {
+                    expHeading = h;
+                    break;
+                }
+            }
+            if (!expHeading) return null;  // no experience section
+
+            // Walk up to the wrapping section / ancestor container.
+            let expSection = expHeading.closest('section')
+                             || expHeading.parentElement?.parentElement
+                             || expHeading.parentElement;
+
+            // ── Inspect the FIRST experience block ──────────────
+            // The employment type line looks like:
+            //   "Contract Full-time · 2 yrs"   ← contract
+            //   "Full-time · 1 yr 3 mos"       ← fine
+            //   "Part-time · 6 mos"            ← flagged
+            //   "Internship · 3 mos"           ← flagged
+            const headRect = expHeading.getBoundingClientRect();
+            const els = expSection.querySelectorAll('p, span, div');
+            for (const el of els) {
+                const text = (el.innerText || el.textContent || '').trim();
+                if (!text || text.length > 80) continue;
+                if (el.children && el.children.length > 4) continue;
+
+                const rect = el.getBoundingClientRect();
+                // Only look within ~250px below the heading (first role)
+                const dist = rect.top - headRect.top;
+                if (dist < 0 || dist > 250) continue;
+
+                const lower = text.toLowerCase();
+                if (/\bcontract\b/i.test(lower)) return text;
+                if (/\b(freelance|part[- ]?time|internship|temporary|temp)\b/i.test(lower)
+                    && !/\bfull[- ]?time\b/i.test(lower)) return text;
+            }
+            return null;
+        """)
+        if employment_type:
+            logger.debug(f"  📋 Detected non-FT employment: '{employment_type}'")
+            return True
+    except Exception as e:
+        logger.debug(f"  Contract check failed (proceeding anyway): {e}")
+    return False
+
+
 def _send_connection_with_note(
     driver: webdriver.Chrome,
     contact: Contact,
@@ -1196,7 +1306,7 @@ def _send_connection_with_note(
     """
     Navigate to the contact's profile and send a Connect request
     with a personalized note, or a DM if already connected.
-    Returns: 'connection_sent', 'dm_sent', or 'failed'.
+    Returns: 'connection_sent', 'dm_sent', 'contract_skip', or 'failed'.
     """
     try:
         if not safe_get(driver, contact.profile_url):
@@ -1206,6 +1316,11 @@ def _send_connection_with_note(
         # Uses content-scaled timing, Bézier mouse, scroll-back patterns
         get_session().record_profile_view()
         realistic_profile_reading(driver)
+
+        # ── Skip contract / non-FT employees ─────────────────────
+        if _is_contract_employee(driver):
+            logger.info(f"  📋 Skipping {contact.name} — contract/non-FT employee")
+            return "contract_skip"
 
         # _get_connection_status scrolls to top internally
         status = _get_connection_status(driver)
