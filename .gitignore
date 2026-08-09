@@ -4,6 +4,8 @@
 # Database, logs, and debug outputs
 data/*.db
 data/logs/
+data/debug/
+data/screenshots/
 data/debug_page.html
 data/debug_page.png
 data/login_failure.html

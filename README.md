@@ -109,6 +109,18 @@ python -c "import sqlite3; conn = sqlite3.connect('data/jobs.db'); [print(f'{r[0
 
 ---
 
+## 🧪 Testing
+
+Run the automated test suite before changing selectors, filters, scoring, or safety limits:
+
+```powershell
+python -m pytest
+```
+
+Or double-click **`run_tests.bat`** on Windows. The tests cover the pure referral-bot logic: geo filtering, job ranking, company matching, contact filtering, message length, database dedupe, weekly activity counting, and profile-view safety caps.
+
+---
+
 ## 🔄 What the Bot Does Each Run
 
 1. **Weekly safety check** — stops if weekly limits already hit

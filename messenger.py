@@ -23,11 +23,17 @@ from selenium.common.exceptions import (
 )
 
 from config import Config
+from geo import (
+    contact_location_priority,
+    is_canadian_location,
+    is_north_american_location,
+    is_preferred_canadian_location,
+    is_quebec_location,
+    is_remote_or_us_job_location,
+)
 from models import Job, Contact, Database
-from email_outreach import discover_email
 from utils import (
-    get_logger, human_delay, long_delay, scroll_page,
-    human_move_and_click, simulate_random_mouse_movement,
+    get_logger, human_delay, scroll_page,
 )
 from antidetect import (
     get_session, is_session_safe, check_for_linkedin_warnings,
@@ -74,6 +80,7 @@ def find_and_message_employees(
     """
     total_sent = 0
     connections_today = 0  # track new connection requests (DMs don't count toward weekly limit)
+    profile_views_this_run = 0
     companies_processed: set[str] = set()
 
     # ── Weekly safety checks ──────────────────────────────────────
@@ -145,18 +152,17 @@ def find_and_message_employees(
             logger.info(f"  → No reachable contacts found at {company}")
             continue
 
-        # Filter out low-value contacts (students, interns, freelancers)
-        contacts = _filter_contacts(contacts)
-
-        # Sort by relevance score — best contacts first.
-        # Main loop caps at MAX_MESSAGES_PER_COMPANY successful sends.
-        contacts.sort(key=_score_contact, reverse=True)
-
         sent_at_company = 0
         for contact in contacts:
             if total_sent >= Config.MAX_MESSAGES_PER_DAY:
                 break
             if (weekly_connections + connections_today) >= Config.MAX_CONNECTIONS_PER_WEEK:
+                break
+            if (weekly_profiles + profile_views_this_run) >= Config.MAX_PROFILE_VIEWS_PER_WEEK:
+                logger.info(
+                    "🛑 Weekly profile-view limit reached during outreach. Stopping."
+                )
+                weekly_limit_hit = True
                 break
             if sent_at_company >= Config.MAX_MESSAGES_PER_COMPANY:
                 logger.debug(f"  → Hit per-company limit ({Config.MAX_MESSAGES_PER_COMPANY}) for {company}, moving on.")
@@ -176,6 +182,7 @@ def find_and_message_employees(
 
             # Track profile view
             db.log_activity("profile_view", contact.profile_url)
+            profile_views_this_run += 1
 
             # ── Human pattern: browse-without-acting ─────────────
             # Real humans view some profiles and move on without
@@ -219,17 +226,6 @@ def find_and_message_employees(
                 sent_at_company += 1
                 logger.info(f"  ✉️  Sent referral request to {contact.name} ({company})")
 
-                # ── Email discovery (for next-day follow-up) ─────────
-                if Config.EMAIL_ENABLED:
-                    try:
-                        db.set_contact_job_id(contact.contact_id, job.job_id)
-                        email = discover_email(contact)
-                        if email:
-                            db.set_contact_email(contact.contact_id, email)
-                            logger.debug(f"  📧 Discovered email: {email}")
-                    except Exception as e:
-                        logger.debug(f"  Email discovery failed: {e}")
-
                 # ── Anti-detection: fatigue-aware delay after send ──
                 # Uses session velocity + fatigue multiplier for
                 # realistic pacing that slows down over time.
@@ -253,9 +249,11 @@ def find_and_message_employees(
         f"✅ Total referral messages sent this run: {total_sent} "
         f"({connections_today} new connections, {total_sent - connections_today} DMs)"
     )
+    final_weekly_connections = db.weekly_connections_sent()
+    final_weekly_profiles = db.weekly_profiles_viewed()
     logger.info(
-        f"📊 Updated weekly totals: ~{weekly_connections + connections_today} connections, "
-        f"~{weekly_profiles + len(companies_processed)} profile views"
+        f"📊 Updated weekly totals: {final_weekly_connections} connections, "
+        f"{final_weekly_profiles} profile views"
     )
     return total_sent
 
@@ -484,6 +482,13 @@ def _score_contact(contact: Contact) -> int:
     if any(w in title for w in ("senior", "lead", "principal", "staff", "manager", "director")):
         score += 5
 
+    # Prefer big Canadian metros, but still allow broader Canada / NA fallback.
+    location = contact.location or ""
+    if is_preferred_canadian_location(location):
+        score += 10
+    elif location and is_canadian_location(location) and not is_quebec_location(location):
+        score += 4
+
     return score
 
 
@@ -570,69 +575,130 @@ def _filter_contacts(contacts: list[Contact]) -> list[Contact]:
     return filtered
 
 
-# ── Geography helpers ─────────────────────────────────────────────────
+def _apply_contact_mix(
+    contacts: list[Contact],
+    max_results: int,
+    *,
+    allow_recruiter: bool = True,
+) -> list[Contact]:
+    """Keep the candidate pool mostly technical, with a small recruiter lane."""
+    if not contacts or max_results <= 0:
+        return []
 
-# Canadian province / territory codes + common location strings
-_CANADA_LOCATION_KEYWORDS = [
-    "canada",
-    # Provinces
-    "ontario", ", on", "toronto", "ottawa", "waterloo", "kitchener",
-    "mississauga", "hamilton", "london, on", "brampton", "markham",
-    "british columbia", ", bc", "vancouver", "victoria, bc", "burnaby", "surrey",
-    "quebec", ", qc", "montreal", "montréal", "québec", "laval",
-    "alberta", ", ab", "calgary", "edmonton",
-    "manitoba", ", mb", "winnipeg",
-    "saskatchewan", ", sk", "saskatoon", "regina",
-    "nova scotia", ", ns", "halifax",
-    "new brunswick", ", nb", "moncton", "fredericton",
-    "newfoundland", ", nl", "st. john's",
-    "prince edward island", ", pe", "charlottetown",
-]
+    ranked = sorted(contacts, key=_score_contact, reverse=True)
+    recruiter_slots = 1 if allow_recruiter and max_results >= 4 else 0
+    technical_slots = max(1, max_results - recruiter_slots)
+    mixed = _split_contacts_by_role(
+        ranked,
+        max_recruiters=recruiter_slots,
+        max_technical=technical_slots,
+    )
 
-# Broader North America (US states, etc.) — used if no Canadian contacts found
-_NA_LOCATION_KEYWORDS = _CANADA_LOCATION_KEYWORDS + [
-    "united states", ", us",
-    "new york", "san francisco", "seattle", "austin", "chicago",
-    "boston", "los angeles", "denver", "atlanta", "dallas",
-    "washington", "portland", "philadelphia", "miami",
-    "north america",
-]
+    seen_ids = {c.contact_id for c in mixed}
+    for contact in ranked:
+        if len(mixed) >= max_results:
+            break
+        if contact.contact_id in seen_ids:
+            continue
+        mixed.append(contact)
+        seen_ids.add(contact.contact_id)
 
-
-def _is_canadian_location(location: str) -> bool:
-    """Check if a location string looks Canadian."""
-    loc = location.lower()
-    return any(kw in loc for kw in _CANADA_LOCATION_KEYWORDS)
+    return mixed
 
 
-def _is_north_american_location(location: str) -> bool:
-    """Check if a location string looks North American (CA or US)."""
-    loc = location.lower()
-    return any(kw in loc for kw in _NA_LOCATION_KEYWORDS)
+def _select_contacts_for_outreach(
+    contacts: list[Contact],
+    company: str,
+    job: Job | None,
+    max_results: int,
+    *,
+    source_label: str,
+) -> list[Contact]:
+    """Apply geo, title, and role-mix logic before outreach."""
+    if not contacts:
+        return []
 
+    allow_north_america = is_remote_or_us_job_location(job.location if job else "")
+    filtered = _filter_contacts(contacts)
 
-def _is_remote_or_us_job(job: Job | None) -> bool:
-    """Check if a job is US-based or a remote role with no clear Canadian location.
+    quebec_filtered = [c for c in filtered if c.location and is_quebec_location(c.location)]
+    if quebec_filtered:
+        logger.info(
+            f"  → Filtered {len(quebec_filtered)} Quebec contact(s) for {company}"
+        )
+    filtered = [c for c in filtered if not c.location or not is_quebec_location(c.location)]
+    if not filtered:
+        return []
 
-    For these jobs, we accept North American contacts rather than
-    filtering strictly for Canadian ones.
-    """
-    if not job:
-        return False
-    loc = job.location.lower()
-    # Clearly US-based
-    if "united states" in loc or ", us" in loc:
-        return True
-    # US city names in location
-    _US_CITIES = ["new york", "san francisco", "seattle", "austin", "chicago",
-                  "boston", "los angeles", "denver", "atlanta", "dallas",
-                  "washington", "portland", "philadelphia", "miami"]
-    if any(city in loc for city in _US_CITIES):
-        return True
-    # "Remote" without any Canadian indicator → likely US remote
-    if "remote" in loc and not _is_canadian_location(loc):
-        return True
-    return False
+    filtered.sort(
+        key=lambda c: (
+            contact_location_priority(
+                c.location,
+                allow_north_america=allow_north_america,
+            ),
+            _score_contact(c),
+        ),
+        reverse=True,
+    )
+
+    preferred = [
+        c for c in filtered
+        if c.location and is_preferred_canadian_location(c.location)
+    ]
+    canadian = [
+        c for c in filtered
+        if c.location
+        and is_canadian_location(c.location)
+        and not is_preferred_canadian_location(c.location)
+    ]
+    north_american = [
+        c for c in filtered
+        if c.location
+        and not is_canadian_location(c.location)
+        and is_north_american_location(c.location)
+    ]
+    unknown = [c for c in filtered if not c.location]
+
+    geo_pool = preferred + canadian + unknown
+    if allow_north_america:
+        geo_pool += north_american
+
+    relevant = _filter_relevant_titles(geo_pool)
+    if relevant:
+        picked = _apply_contact_mix(relevant, max_results)
+        logger.info(
+            f"  → {source_label}: using {len(picked)} relevant contacts "
+            f"({len(preferred)} preferred-city, {len(canadian)} other-Canada, "
+            f"{len(unknown)} unknown-loc"
+            + (f", {len(north_american)} NA fallback" if allow_north_america else "")
+            + ")"
+        )
+        return picked
+
+    titled_scored = [c for c in geo_pool if c.title and _score_contact(c) > 0]
+    if titled_scored:
+        picked = _apply_contact_mix(titled_scored, max_results)
+        logger.warning(
+            f"  ⚠️  {source_label}: no strict relevant titles for {company}; "
+            f"falling back to {len(picked)} scored titled contacts."
+        )
+        return picked
+
+    titled_any = [c for c in geo_pool if c.title]
+    if titled_any:
+        picked = _apply_contact_mix(titled_any, max_results, allow_recruiter=False)
+        logger.warning(
+            f"  ⚠️  {source_label}: title signals are weak for {company}; "
+            f"using {len(picked)} titled fallback contacts."
+        )
+        return picked
+
+    picked = geo_pool[:min(max_results, max(2, Config.MAX_MESSAGES_PER_COMPANY + 1))]
+    logger.warning(
+        f"  ⚠️  {source_label}: LinkedIn hid too much contact metadata for {company}; "
+        f"using only {len(picked)} minimal-profile fallback contacts."
+    )
+    return picked
 
 
 def _company_name_matches(expected: str, found: str) -> bool:
@@ -640,7 +706,7 @@ def _company_name_matches(expected: str, found: str) -> bool:
     Check if a found company name is a reasonable match for the expected one.
     Handles cases like 'Unity' vs 'Unity Technologies' or 'IBM' vs 'IBM Canada'.
     """
-    return _company_match_score(expected, found) >= 45
+    return _company_match_score(expected, found) >= 60
 
 
 def _normalize_company_name(name: str) -> str:
@@ -699,6 +765,109 @@ def _company_match_score(expected: str, found: str) -> int:
     if e_tokens and f_tokens and e_tokens[0] == f_tokens[0]:
         score += 10
     return min(score, 95)
+
+
+_COMPANY_PAGE_MATCH_THRESHOLD = 60
+_PERSON_COMPANY_MATCH_THRESHOLD = 55
+
+
+def _company_match_chunks(text: str) -> list[str]:
+    """Break free-form person-card text into candidate company chunks."""
+    clean = re.sub(r"\s+", " ", (text or "")).strip()
+    if not clean:
+        return []
+
+    chunks: list[str] = [clean]
+    seen = {clean.lower()}
+
+    for separator in ("\n", "|", "·", "•", ",", "/"):
+        for part in clean.split(separator):
+            part = part.strip(" :-")
+            if len(part) < 2:
+                continue
+            lower = part.lower()
+            if lower not in seen:
+                seen.add(lower)
+                chunks.append(part)
+
+    for match in re.finditer(r"(?:@|\bat\b)\s+([^|·•,\n/]{2,80})", clean, re.IGNORECASE):
+        part = match.group(1).strip(" :-")
+        if part and part.lower() not in seen:
+            seen.add(part.lower())
+            chunks.append(part)
+
+    for match in re.finditer(r"\bcurrent:\s*([^|·•\n]{2,120})", clean, re.IGNORECASE):
+        part = match.group(1).strip(" :-")
+        if part and part.lower() not in seen:
+            seen.add(part.lower())
+            chunks.append(part)
+        if " at " in part.lower():
+            tail = part.rsplit(" at ", 1)[-1].strip(" :-")
+            if tail and tail.lower() not in seen:
+                seen.add(tail.lower())
+                chunks.append(tail)
+
+    return chunks
+
+
+def _person_matches_expected_company(
+    person: dict[str, str],
+    expected_company: str,
+    min_score: int = _PERSON_COMPANY_MATCH_THRESHOLD,
+) -> bool:
+    """Require positive employer evidence before using people-search contacts."""
+    expected_tokens = _normalize_company_name(expected_company).split()
+    evidence_fields = (
+        person.get("company_hint", ""),
+        person.get("summary", ""),
+        person.get("title", ""),
+        person.get("card_text", ""),
+    )
+
+    best_score = 0
+    best_chunk = ""
+    for field in evidence_fields:
+        for chunk in _company_match_chunks(field):
+            chunk_tokens = _normalize_company_name(chunk).split()
+            if (
+                len(expected_tokens) > 1
+                and len(chunk_tokens) == 1
+                and is_north_american_location(chunk)
+            ):
+                continue
+            score = _company_match_score(expected_company, chunk)
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
+
+    if best_score >= min_score:
+        logger.debug(
+            f"  Company evidence match for '{expected_company}': '{best_chunk}' "
+            f"(score={best_score})"
+        )
+        return True
+
+    logger.debug(
+        f"  Rejecting people-search contact for '{expected_company}' "
+        f"(best company evidence score={best_score})"
+    )
+    return False
+
+
+def _current_company_page_name(driver: webdriver.Chrome) -> str:
+    """Read the visible company name from the current LinkedIn company page."""
+    try:
+        return (
+            driver.execute_script(
+                """
+                const heading = document.querySelector('h1');
+                return heading ? (heading.innerText || heading.textContent || '').trim() : '';
+                """
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
 
 
 def _extract_people_from_current_page(
@@ -791,6 +960,7 @@ def _extract_people_from_current_page(
                     title: title,
                     location: location,
                     link: href,
+                    card_text: card ? clean(card.innerText || '') : nameRaw,
                 });
                 seen.add(href);
 
@@ -812,6 +982,8 @@ def _build_contacts_from_people_data(
     company: str,
     people_data: list[dict],
     max_results: int,
+    *,
+    strict_company_match: bool = False,
 ) -> list[Contact]:
     """Convert raw extracted people dicts to Contact records."""
     contacts: list[Contact] = []
@@ -824,6 +996,8 @@ def _build_contacts_from_people_data(
         person_location = (person.get("location") or "").strip()
 
         if not name or not profile_url:
+            continue
+        if strict_company_match and not _person_matches_expected_company(person, company):
             continue
 
         first_name = name.split()[0] if name else "there"
@@ -884,7 +1058,7 @@ def _browse_company_people_page(
         )
         if not safe_get(driver, search_url):
             return contacts
-        db.log_activity("profile_view", f"company_search:{company}")
+        db.log_activity("company_search", company)
 
         # ── Find the RIGHT company from search results ──────────────
         company_url = ""
@@ -934,48 +1108,57 @@ def _browse_company_people_page(
                         best_score = score
                         best_result = r
 
-                if best_result and best_score >= 45:
+                if best_result and best_score >= _COMPANY_PAGE_MATCH_THRESHOLD:
                     company_url = best_result["url"]
                     logger.debug(
                         f"  ✅ Matched company: '{best_result['name']}' "
                         f"(score={best_score}) → {company_url}"
                     )
                 else:
-                    # No strong match — fall back to the top result rather than skipping.
                     found_names = [r["name"] for r in results[:5]]
                     if best_result:
-                        company_url = best_result["url"]
                         logger.warning(
-                            f"  ⚠️  Weak company match for '{company}' (best score={best_score}). "
-                            f"Using '{best_result['name']}' and continuing. Candidates: {found_names}"
+                            f"  ⚠️  Weak company-page match for '{company}' "
+                            f"(best='{best_result['name']}', score={best_score}). "
+                            f"Falling back to people search. Candidates: {found_names}"
                         )
                     else:
                         logger.warning(
-                            f"  ⚠️  No company results for '{company}'. Candidates: {found_names}"
+                            f"  ⚠️  No company-page results for '{company}'. "
+                            f"Falling back to people search. Candidates: {found_names}"
                         )
+                    return contacts
         except TimeoutException:
             pass
 
         if not company_url:
-            # Last resort: construct URL from company name
-            slug = company.lower().replace(" ", "-").replace(".", "").replace(",", "")
-            slug = slug.replace("inc", "").replace("ltd", "").replace("llc", "").strip("-")
-            company_url = f"https://www.linkedin.com/company/{slug}"
-            logger.debug(f"  Trying direct company URL: {company_url}")
+            logger.debug(
+                f"  No trustworthy company page match for {company}; "
+                "falling back to people search."
+            )
+            return contacts
 
         # ── Go to /people/ tab with geo filter ──────────────────────
         # LinkedIn /people/ page supports keyword filtering.
         # Add "Canada" keyword for Canadian jobs; skip for US remote roles.
         people_url = company_url.rstrip("/") + "/people/"
         job_location = (job.location if job else "").strip()
-        if not _is_remote_or_us_job(job) and (
-            _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
+        if not is_remote_or_us_job_location(job_location) and (
+            is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
         ):
             people_url += "?keywords=Canada"
 
         if not safe_get(driver, people_url):
             return contacts
         scroll_page(driver, scrolls=10)
+
+        page_company = _current_company_page_name(driver)
+        if page_company and _company_match_score(company, page_company) < _COMPANY_PAGE_MATCH_THRESHOLD:
+            logger.warning(
+                f"  ⚠️  Company page mismatch for '{company}' → loaded '{page_company}'. "
+                f"Falling back to people search."
+            )
+            return contacts
 
         # Extract ALL people using JS — artdeco-entity-lockup with /in/ links
         # Also grab location (caption element) for geo filtering
@@ -992,7 +1175,13 @@ def _browse_company_people_page(
                 const location = captionEl ? (captionEl.innerText || captionEl.textContent || '').trim() : '';
                 const link = linkEl.href.split('?')[0];
                 if (name && name.toLowerCase() !== 'linkedin member') {
-                    results.push({name: name, title: subtitle, location: location, link: link});
+                    results.push({
+                        name: name,
+                        title: subtitle,
+                        location: location,
+                        link: link,
+                        card_text: (card.innerText || card.textContent || '').trim(),
+                    });
                 }
             });
             return results;
@@ -1022,50 +1211,18 @@ def _browse_company_people_page(
             _save_contact_debug_snapshot(driver, company, "people_parse_empty")
             return contacts
 
-        # ── Geographic filtering ────────────────────────────────────
-        # Prefer Canadian contacts; fall back to North American if needed
-        canadian = [c for c in all_contacts if c.location and _is_canadian_location(c.location)]
-        north_american = [c for c in all_contacts if c.location and _is_north_american_location(c.location)]
-
-        if canadian:
-            geo_filtered = canadian
-            logger.debug(f"  🍁 {len(canadian)} Canadian contacts (out of {len(all_contacts)})")
-        elif north_american:
-            geo_filtered = north_american
-            logger.debug(f"  🌎 {len(north_american)} North American contacts (out of {len(all_contacts)})")
-        else:
-            # If no location data available (company page doesn't show it), keep all
-            geo_filtered = all_contacts
-            logger.debug(f"  No geo data found, keeping all {len(all_contacts)} contacts")
-
-        # Only keep people with relevant titles for our field
-        relevant = _filter_relevant_titles(geo_filtered)
-        if not relevant:
-            # LinkedIn occasionally hides title/location snippets on people cards.
-            # Degrade gracefully instead of dropping the company entirely.
-            fallback = _filter_contacts(geo_filtered)
-            fallback.sort(key=_score_contact, reverse=True)
-            fallback = fallback[:max_results]
-            if fallback:
-                logger.warning(
-                    f"  ⚠️  {len(all_contacts)} people found at {company} but no strict title matches; "
-                    f"using {len(fallback)} fallback contacts."
-                )
-                return fallback
-
-            logger.info(
-                f"  → {len(all_contacts)} people found but none passed title/block filters for {company}"
-            )
-            return contacts
-
-        # Sort by relevance — main loop caps at MAX_MESSAGES_PER_COMPANY
-        relevant.sort(key=_score_contact, reverse=True)
-        contacts = relevant[:max_results]
-
-        logger.info(
-            f"  → Found {len(contacts)} relevant contacts out of {len(all_contacts)} "
-            f"(titles: {', '.join(c.title[:30] for c in contacts[:12])})"
+        contacts = _select_contacts_for_outreach(
+            all_contacts,
+            company,
+            job,
+            max_results,
+            source_label="company people page",
         )
+        if contacts:
+            logger.info(
+                f"  → Found {len(contacts)} outreach candidates out of {len(all_contacts)} "
+                f"(titles: {', '.join(c.title[:30] for c in contacts[:12])})"
+            )
 
     except Exception as e:
         logger.debug(f"Company people page approach failed for {company}: {e}")
@@ -1087,8 +1244,8 @@ def _search_company_employees(
     # Add "Canada" to keywords for Canadian jobs; skip for US remote roles
     geo_suffix = ""
     job_location = (job.location if job else "").strip()
-    if not _is_remote_or_us_job(job) and (
-        _is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
+    if not is_remote_or_us_job_location(job_location) and (
+        is_canadian_location(job_location) or "canada" in Config.JOB_LOCATION.lower()
     ):
         geo_suffix = " Canada"
 
@@ -1137,13 +1294,22 @@ def _search_company_employees(
                     const name = nameEl.textContent.trim();
                     if (!name || name.toLowerCase() === 'linkedin member') return;
                     let title = subtitleEl ? subtitleEl.textContent.trim() : '';
+                    const summary = summaryEl ? summaryEl.textContent.trim() : '';
                     if (!title && summaryEl) {
                         title = summaryEl.textContent.trim().replace(/^Current:\\s*/i, '');
                     }
                     const location = secondaryEl ? secondaryEl.textContent.trim() : '';
                     const link = linkEl ? linkEl.href.split('?')[0] : '';
                     if (link) {
-                        results.push({ name, link, title, location });
+                        results.push({
+                            name,
+                            link,
+                            title,
+                            location,
+                            summary,
+                            company_hint: summary,
+                            card_text: (card.innerText || card.textContent || '').trim(),
+                        });
                     }
                 });
                 return results;
@@ -1174,27 +1340,22 @@ def _search_company_employees(
         company,
         people_data,
         max_results=max(max_results * 3, 40),
+        strict_company_match=True,
     )
 
     if not contacts:
-        logger.debug(f"  Search fallback: extracted rows but no valid contacts for {company}")
+        logger.debug(
+            f"  Search fallback: extracted rows but no company-verified contacts for {company}"
+        )
         return contacts
 
-    # Prefer relevant roles, but gracefully keep fallback contacts when title snippets are missing.
-    relevant = _filter_relevant_titles(contacts)
-    if relevant:
-        relevant.sort(key=_score_contact, reverse=True)
-        return relevant[:max_results]
-
-    contacts = _filter_contacts(contacts)
-    contacts.sort(key=_score_contact, reverse=True)
-    logger.warning(
-        f"  ⚠️  Search found contacts for {company} but no strict relevant-title matches; "
-        f"using {min(len(contacts), max_results)} fallback contacts."
+    return _select_contacts_for_outreach(
+        contacts,
+        company,
+        job,
+        max_results,
+        source_label="people search",
     )
-    return contacts[:max_results]
-
-    return contacts
 
 
 def _scroll_profile_main(driver: webdriver.Chrome):
@@ -1236,13 +1397,15 @@ def _scroll_profile_main(driver: webdriver.Chrome):
 
 
 def _is_contract_employee(driver: webdriver.Chrome) -> bool:
-    """Check if the current profile's FIRST experience entry is contract/non-FT.
+    """Check if the current profile's CURRENT role is contract/non-FT.
 
     LinkedIn renders profiles inside ``<main id="workspace">`` with
     ``overflow: scroll``.  We must scroll **that** container (not the
-    window) to force-load the Experience section, then inspect the
-    first company block for employment-type text like
-    ``"Contract Full-time · 2 yrs"`` or ``"Part-time · 6 mos"``.
+    window) to force-load the Experience section.  We collect all
+    employment-type labels within 250px of the heading, sort by
+    proximity, and only flag if the **closest** one (= current role)
+    is non-FT.  This avoids false positives when someone previously
+    interned at a company but is now full-time there.
     """
     try:
         # Step 1: scroll the main container to load Experience section
@@ -1265,29 +1428,40 @@ def _is_contract_employee(driver: webdriver.Chrome) -> bool:
                              || expHeading.parentElement?.parentElement
                              || expHeading.parentElement;
 
-            // ── Inspect the FIRST experience block ──────────────
-            // The employment type line looks like:
-            //   "Contract Full-time · 2 yrs"   ← contract
-            //   "Full-time · 1 yr 3 mos"       ← fine
-            //   "Part-time · 6 mos"            ← flagged
-            //   "Internship · 3 mos"           ← flagged
+            // ── Inspect the FIRST (current) experience role ─────
+            // Collect ALL employment-type mentions within 250px,
+            // then only judge by the CLOSEST one to the heading
+            // (= most-recent / current role).  This avoids false
+            // positives when someone interned at a company and was
+            // later promoted to full-time.
             const headRect = expHeading.getBoundingClientRect();
             const els = expSection.querySelectorAll('p, span, div');
+            const hits = [];
             for (const el of els) {
                 const text = (el.innerText || el.textContent || '').trim();
                 if (!text || text.length > 80) continue;
                 if (el.children && el.children.length > 4) continue;
 
                 const rect = el.getBoundingClientRect();
-                // Only look within ~250px below the heading (first role)
                 const dist = rect.top - headRect.top;
                 if (dist < 0 || dist > 250) continue;
 
                 const lower = text.toLowerCase();
-                if (/\bcontract\b/i.test(lower)) return text;
-                if (/\b(freelance|part[- ]?time|internship|temporary|temp)\b/i.test(lower)
-                    && !/\bfull[- ]?time\b/i.test(lower)) return text;
+                const isFT = /\bfull[- ]?time\b/i.test(lower);
+                const isContract = /\bcontract\b/i.test(lower) && !isFT;
+                const isNonFT = /\b(freelance|part[- ]?time|internship|temporary|temp)\b/i.test(lower) && !isFT;
+
+                if (isFT || isContract || isNonFT) {
+                    hits.push({dist, text, isFT, isContract, isNonFT});
+                }
             }
+            if (hits.length === 0) return null;
+            // Sort by distance from heading — closest = current role
+            hits.sort((a, b) => a.dist - b.dist);
+            const first = hits[0];
+            if (first.isFT) return null;          // current role is FT
+            if (first.isContract) return first.text;
+            if (first.isNonFT) return first.text;
             return null;
         """)
         if employment_type:

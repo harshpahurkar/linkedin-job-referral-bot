@@ -21,6 +21,7 @@ from selenium.common.exceptions import (
 )
 
 from config import Config
+from geo import is_quebec_location, job_location_preference_score
 from models import Job, Database
 from utils import get_logger, human_delay
 from antidetect import (
@@ -29,7 +30,7 @@ from antidetect import (
 
 logger = get_logger("scraper")
 
-# ── Company Blacklist (module-level so post_hunter.py can import it) ──
+# ── Company Blacklist ─────────────────────────────────────────────────
 # Only block gig platforms, data labeling, freelance marketplaces,
 # predatory training traps, and pure staffing/temp middlemen.
 # Real IT companies (even body shops like Infosys/Cognizant/CGI) are kept —
@@ -85,6 +86,13 @@ _COMPANY_BLACKLIST_KEYWORDS = {
     "apc workforce", "zerochaos",
     "procom", "s.i. systems", "si systems",
     "tundra technical", "thompson trembley",
+    "applicantz", "global technical talent", "alquemy search",
+    "hunter bond", "ram talent partners", "apetan consulting",
+    "amiseq", "astra-north", "astra north", "akraya",
+    "encore technical solutions", "aquent talent",
+    "talentsphere staffing", "infotek consulting",
+    "jobright.ai", "jobright", "jobs ai", "jobgether",
+    "crossing hurdles", "twine",
 
     # ── Generic keyword patterns (catch-all for agencies) ────
     "staffing agency", "recruiting agency", "recruitment agency",
@@ -424,6 +432,12 @@ _SENIORITY_BLACKLIST = {
     "team lead", "tech lead", "engineering manager",
 }
 
+_ROLE_TYPE_BLACKLIST = {
+    "intern", "internship", "co-op", "coop",
+    "freelance", "contract", "temporary", "temp ",
+    "part-time", "part time", "$/hr", "/hr",
+}
+
 
 def _filter_and_rank(
     jobs: list[Job],
@@ -460,6 +474,28 @@ def _filter_and_rank(
             f"(staffing/gig/outsourcing/body shops)"
         )
 
+    # ── Hard-filter: drop internships, contract/hourly gigs, temp roles ──
+    pre_role_type = len(jobs)
+    jobs = [
+        job for job in jobs
+        if not any(term in job.title.lower() for term in _ROLE_TYPE_BLACKLIST)
+    ]
+    filtered_role_type = pre_role_type - len(jobs)
+    if filtered_role_type:
+        logger.info(
+            f"🚫 Filtered out {filtered_role_type} internship/contract/gig roles"
+        )
+
+    # ── Hard-filter: drop Quebec jobs ───────────────────────────────
+    pre_quebec = len(jobs)
+    jobs = [job for job in jobs if not is_quebec_location(job.location)]
+    filtered_quebec = pre_quebec - len(jobs)
+    if filtered_quebec:
+        logger.info(
+            f"🚫 Filtered out {filtered_quebec} Quebec job(s) "
+            f"(French-first locations)"
+        )
+
     # ── Dedup multi-location postings (same company + title) ─────
     # Companies like BDO Canada post the same role in 8 cities.
     # Keep only the best-scoring location to free up batch slots.
@@ -475,10 +511,14 @@ def _filter_and_rank(
         key = (job.company.lower().strip(), job.title.lower().strip())
         if key in seen_roles:
             deduped_locations += 1
-            # Prefer Toronto-area or remote locations over others
+            # Prefer higher-scoring locations when the same role appears in many cities.
+            loc_score = job_location_preference_score(job.location)
+            existing_score = job_location_preference_score(seen_roles[key].location)
             loc = job.location.lower() if job.location else ""
             existing_loc = seen_roles[key].location.lower() if seen_roles[key].location else ""
-            if any(s in loc for s in _loc_boost) and not any(s in existing_loc for s in _loc_boost):
+            if loc_score > existing_score:
+                seen_roles[key] = job
+            elif loc_score == existing_score and any(s in loc for s in _loc_boost) and not any(s in existing_loc for s in _loc_boost):
                 seen_roles[key] = job
         else:
             seen_roles[key] = job
@@ -610,17 +650,9 @@ def _score_job_relevance(
     freshness_bonus = (num_windows - 1 - window_idx) * 0.8
     score += freshness_bonus
 
-    # ── Toronto / GTA location boost ─────────────────────────────
-    # We search Canada-wide in one pass, but prefer jobs near Toronto.
-    loc_lower = job.location.lower() if job.location else ""
-    _TORONTO_SIGNALS = (
-        "toronto", "mississauga", "markham", "brampton",
-        "scarborough", "north york", "etobicoke", "vaughan",
-        "richmond hill", "oakville", "burlington", "hamilton",
-        "gta", "greater toronto",
-    )
-    if any(sig in loc_lower for sig in _TORONTO_SIGNALS):
-        score += 3.0
+    # ── Location preference boost ─────────────────────────────────
+    # Prefer big Canadian metros and tech hubs, but fully block Quebec earlier.
+    score += max(0.0, job_location_preference_score(job.location))
 
     return round(score, 1)
 

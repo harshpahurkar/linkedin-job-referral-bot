@@ -93,19 +93,14 @@ class Database:
                 detail          TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS hiring_posts (
-                post_id         TEXT PRIMARY KEY,
-                poster_name     TEXT,
-                poster_title    TEXT,
-                poster_url      TEXT,
-                company         TEXT,
-                post_text       TEXT,
-                post_url        TEXT,
-                score           INTEGER DEFAULT 0,
-                action_taken    TEXT DEFAULT '',
-                date_found      TEXT,
-                engaged         INTEGER DEFAULT 0
-            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_referral_requested
+                ON jobs(referral_requested);
+            CREATE INDEX IF NOT EXISTS idx_contacts_messaged
+                ON contacts(messaged);
+            CREATE INDEX IF NOT EXISTS idx_contacts_company
+                ON contacts(company);
+            CREATE INDEX IF NOT EXISTS idx_weekly_activity_type_date
+                ON weekly_activity(action_type, action_date);
             """
         )
         self.conn.commit()
@@ -121,23 +116,6 @@ class Database:
         if "location" not in cols:
             self.conn.execute(
                 "ALTER TABLE contacts ADD COLUMN location TEXT DEFAULT ''"
-            )
-        # ── Email outreach columns ───────────────────────────────
-        if "email" not in cols:
-            self.conn.execute(
-                "ALTER TABLE contacts ADD COLUMN email TEXT DEFAULT ''"
-            )
-        if "email_sent" not in cols:
-            self.conn.execute(
-                "ALTER TABLE contacts ADD COLUMN email_sent INTEGER DEFAULT 0"
-            )
-        if "email_sent_date" not in cols:
-            self.conn.execute(
-                "ALTER TABLE contacts ADD COLUMN email_sent_date TEXT DEFAULT ''"
-            )
-        if "job_id" not in cols:
-            self.conn.execute(
-                "ALTER TABLE contacts ADD COLUMN job_id TEXT DEFAULT ''"
             )
         self.conn.commit()
 
@@ -272,169 +250,6 @@ class Database:
 
     def weekly_connections_sent(self) -> int:
         return self.get_weekly_count("connection_request")
-
-    # ── Hiring Posts ─────────────────────────────────────────────────
-    def insert_hiring_post(self, post_id: str, poster_name: str,
-                           poster_title: str, poster_url: str,
-                           company: str, post_text: str, post_url: str,
-                           score: int) -> bool:
-        try:
-            self.conn.execute(
-                """INSERT INTO hiring_posts
-                   (post_id, poster_name, poster_title, poster_url,
-                    company, post_text, post_url, score, date_found)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (post_id, poster_name, poster_title, poster_url,
-                 company, post_text, post_url, score,
-                 datetime.now().isoformat()),
-            )
-            self.conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def hiring_post_exists(self, post_id: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM hiring_posts WHERE post_id = ?", (post_id,)
-        ).fetchone()
-        return row is not None
-
-    def mark_post_engaged(self, post_id: str, action: str):
-        self.conn.execute(
-            "UPDATE hiring_posts SET engaged = 1, action_taken = ? WHERE post_id = ?",
-            (action, post_id),
-        )
-        self.conn.commit()
-
-    def mark_post_skipped(self, post_id: str, reason: str):
-        """Record skip reason without counting toward engagement limit."""
-        self.conn.execute(
-            "UPDATE hiring_posts SET action_taken = ? WHERE post_id = ?",
-            (reason, post_id),
-        )
-        self.conn.commit()
-
-    def weekly_post_engagements(self) -> int:
-        seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
-        row = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM hiring_posts "
-            "WHERE engaged = 1 AND action_taken IN ('connection_sent', 'dm_sent') "
-            "AND date_found >= ?",
-            (seven_days_ago,),
-        ).fetchone()
-        return row["cnt"] if row else 0
-
-    # ── Email Outreach ───────────────────────────────────────────────
-    def set_contact_email(self, contact_id: str, email: str):
-        """Store a discovered email address for a contact."""
-        self.conn.execute(
-            "UPDATE contacts SET email = ? WHERE contact_id = ?",
-            (email, contact_id),
-        )
-        self.conn.commit()
-
-    def set_contact_job_id(self, contact_id: str, job_id: str):
-        """Link a contact to the job they were messaged about."""
-        self.conn.execute(
-            "UPDATE contacts SET job_id = ? WHERE contact_id = ?",
-            (job_id, contact_id),
-        )
-        self.conn.commit()
-
-    def mark_email_sent(self, contact_id: str):
-        """Mark that a follow-up email was sent to this contact."""
-        self.conn.execute(
-            "UPDATE contacts SET email_sent = 1, email_sent_date = ? "
-            "WHERE contact_id = ?",
-            (datetime.now().isoformat(), contact_id),
-        )
-        self.conn.commit()
-
-    def weekly_emails_sent(self) -> int:
-        """Count emails sent in the last 7 days."""
-        return self.get_weekly_count("email_sent")
-
-    def daily_emails_sent(self) -> int:
-        """Count emails sent today."""
-        today_start = datetime.now().replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).isoformat()
-        row = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM weekly_activity "
-            "WHERE action_type = 'email_sent' AND action_date >= ?",
-            (today_start,),
-        ).fetchone()
-        return row["cnt"] if row else 0
-
-    def get_pending_email_contacts(
-        self, min_delay_days: int = 1
-    ) -> list[tuple["Contact", "Job"]]:
-        """Get contacts who need a follow-up email.
-
-        Criteria:
-          - messaged = 1 (LinkedIn touch sent)
-          - email is set and non-empty
-          - email_sent = 0 (not yet emailed)
-          - message_date is at least min_delay_days ago
-          - job_id links to a valid job
-        """
-        cutoff = (datetime.now() - timedelta(days=min_delay_days)).isoformat()
-        rows = self.conn.execute(
-            """
-            SELECT c.*, j.job_id as j_job_id, j.title as j_title,
-                   j.company as j_company, j.location as j_location,
-                   j.url as j_url, j.description as j_description,
-                   j.date_scraped as j_date_scraped
-            FROM contacts c
-            JOIN jobs j ON c.job_id = j.job_id
-            WHERE c.messaged = 1
-              AND c.email IS NOT NULL AND c.email != ''
-              AND c.email_sent = 0
-              AND c.message_date <= ?
-            ORDER BY
-              CASE
-                WHEN lower(c.title) LIKE '%recruiter%'
-                  OR lower(c.title) LIKE '%talent%'
-                  OR lower(c.title) LIKE '%hiring%'
-                  OR lower(c.title) LIKE '%human resource%'
-                  OR lower(c.title) LIKE '%people operations%'
-                  OR lower(c.title) LIKE '%hr %'
-                  OR lower(c.title) LIKE '%hr manager%'
-                THEN 0 ELSE 1
-              END,
-              c.message_date ASC
-            """,
-            (cutoff,),
-        ).fetchall()
-
-        results = []
-        for row in rows:
-            contact = Contact(
-                contact_id=row["contact_id"],
-                name=row["name"],
-                first_name=row["first_name"],
-                profile_url=row["profile_url"],
-                company=row["company"],
-                title=row["title"],
-                location=row["location"],
-                messaged=bool(row["messaged"]),
-                message_date=row["message_date"],
-                connected=bool(row["connected"]),
-            )
-            # Attach the email from the DB (not on the dataclass)
-            contact.email = row["email"]
-            job = Job(
-                job_id=row["j_job_id"],
-                title=row["j_title"],
-                company=row["j_company"],
-                location=row["j_location"],
-                url=row["j_url"],
-                description=row["j_description"] or "",
-                date_scraped=row["j_date_scraped"] or "",
-            )
-            results.append((contact, job))
-
-        return results
 
     def close(self):
         self.conn.close()
