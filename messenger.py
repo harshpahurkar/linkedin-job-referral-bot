@@ -73,11 +73,21 @@ def find_and_message_employees(
     driver: webdriver.Chrome,
     db: Database,
     jobs: list[Job],
+    max_to_send: int | None = None,
 ) -> int:
     """
     For each new job, search LinkedIn for employees at that company
     and send a referral request. Returns total messages sent.
+
+    ``max_to_send`` is how many messages this call may send. The pipeline
+    calls this once per time window, so it must pass the *remaining* daily
+    budget — otherwise each window starts its count from zero and the day's
+    total can run to several times the target before the caller notices.
+    Defaults to the full daily cap for a single-batch caller.
     """
+    day_cap = Config.MAX_MESSAGES_PER_DAY if max_to_send is None else max_to_send
+    if day_cap <= 0:
+        return 0
     total_sent = 0
     connections_today = 0  # track new connection requests (DMs don't count toward weekly limit)
     profile_views_this_run = 0
@@ -111,8 +121,8 @@ def find_and_message_employees(
     for job in jobs:
         if weekly_limit_hit:
             break
-        if total_sent >= Config.MAX_MESSAGES_PER_DAY:
-            logger.info(f"🛑 Daily message limit reached ({Config.MAX_MESSAGES_PER_DAY}).")
+        if total_sent >= day_cap:
+            logger.info(f"🛑 Daily message budget reached ({day_cap}).")
             break
         if (weekly_connections + connections_today) >= Config.MAX_CONNECTIONS_PER_WEEK:
             logger.info("🛑 Weekly connection limit reached. Stopping.")
@@ -154,7 +164,7 @@ def find_and_message_employees(
 
         sent_at_company = 0
         for contact in contacts:
-            if total_sent >= Config.MAX_MESSAGES_PER_DAY:
+            if total_sent >= day_cap:
                 break
             if (weekly_connections + connections_today) >= Config.MAX_CONNECTIONS_PER_WEEK:
                 break

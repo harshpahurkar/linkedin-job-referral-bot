@@ -382,7 +382,12 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
             # ── Message this batch ────────────────────────────────
             if batch:
                 logger.info("✉️  Outreach for this batch …")
-                batch_sent = find_and_message_employees(driver, db, batch)
+                # Pass the REMAINING daily budget, not the full cap: this
+                # runs once per time window, and a per-window count that reset
+                # to zero each batch let a day overshoot its target.
+                batch_sent = find_and_message_employees(
+                    driver, db, batch, max_to_send=daily_target - total_msgs_sent
+                )
                 total_msgs_sent += batch_sent
                 logger.info(
                     f"📬 Batch done: {batch_sent} sent this batch, "
