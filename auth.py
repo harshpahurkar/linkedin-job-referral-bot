@@ -19,6 +19,57 @@ logger = get_logger("auth")
 
 LOGIN_URL = "https://www.linkedin.com/login"
 
+# The login form used to carry id="username" / id="password". In 2026 the
+# page is React-rendered with generated ids («R77vvcjksop9h9j6»), and it
+# renders two copies of the form, one hidden. The autocomplete attributes
+# are the stable handle, and only the displayed copy accepts typing.
+_EMAIL_SELECTORS = [
+    "#username",
+    "input[autocomplete~='username']",
+    "input[type='email']",
+]
+_PASSWORD_SELECTORS = [
+    "#password",
+    "input[autocomplete~='current-password']",
+    "input[type='password']",
+]
+
+
+def _find_visible(driver, wait, selectors):
+    """First displayed element matching any selector, in order of preference."""
+    def locate(drv):
+        for selector in selectors:
+            for element in drv.find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if element.is_displayed() and element.is_enabled():
+                        return element
+                except Exception:
+                    continue
+        return False
+    return wait.until(locate)
+
+
+def _fill_field(driver, wait, selectors, text):
+    """Locate a field and type into it, re-locating if React swaps the node.
+
+    The login page hydrates after first paint and replaces the form, so an
+    element found a moment ago can go stale before the first keystroke.
+    """
+    from selenium.common.exceptions import StaleElementReferenceException
+    last_error = None
+    for attempt in range(4):
+        field = _find_visible(driver, wait, selectors)
+        try:
+            field.click()
+            field.clear()
+            _type_like_human(field, text)
+            return field
+        except StaleElementReferenceException as exc:
+            last_error = exc
+            logger.debug(f"  Field went stale (attempt {attempt + 1}), re-locating …")
+            human_delay(1, 2)
+    raise last_error
+
 # ── Selectors that ONLY exist for authenticated users ──────────────
 # The global nav "Me" dropdown photo/icon is a reliable signal.
 _AUTHENTICATED_SELECTORS = [
@@ -66,36 +117,27 @@ def login(driver: webdriver.Chrome) -> bool:
         logger.info(f"  Login page title: {driver.title}")
 
         # Email
-        logger.debug("Looking for #username field …")
-        email_field = wait.until(
-            EC.presence_of_element_located((By.ID, "username"))
-        )
-        logger.debug(f"  Found #username: tag={email_field.tag_name}, displayed={email_field.is_displayed()}")
-
-        # Ensure the field is clickable (dismiss overlays)
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.ID, "username"))
-        )
-
-        email_field.clear()
-        _type_like_human(email_field, Config.LINKEDIN_EMAIL)
+        logger.debug("Looking for the email field …")
+        _fill_field(driver, wait, _EMAIL_SELECTORS, Config.LINKEDIN_EMAIL)
         logger.debug("  Typed email.")
         human_delay(0.5, 1)
 
+        # The React login page renders two copies of the form and hydrates
+        # after first paint, so the password field can be slow to settle or
+        # briefly detached. If it cannot be filled, fall through to the
+        # session check below rather than failing outright — the browser may
+        # already have authenticated from the persistent profile.
         # Password
-        logger.debug("Looking for #password field …")
-        pw_field = wait.until(
-            EC.presence_of_element_located((By.ID, "password"))
-        )
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.ID, "password"))
-        )
-        pw_field.click()
-        logger.debug(f"  Found #password: tag={pw_field.tag_name}, displayed={pw_field.is_displayed()}")
-        pw_field.clear()
-        _type_like_human(pw_field, Config.LINKEDIN_PASSWORD)
-        logger.debug("  Typed password.")
-        human_delay(0.5, 1)
+        logger.debug("Looking for the password field …")
+        try:
+            pw_field = _fill_field(driver, wait, _PASSWORD_SELECTORS, Config.LINKEDIN_PASSWORD)
+            logger.debug("  Typed password.")
+            human_delay(0.5, 1)
+        except TimeoutException:
+            if _is_logged_in(driver):
+                logger.info("Already authenticated before the password step.")
+                return True
+            raise
 
         # Uncheck "Keep me logged in" — belt-and-suspenders alongside
         # the disposable profile nuke.  If a crash prevents cleanup,
@@ -155,6 +197,15 @@ def login(driver: webdriver.Chrome) -> bool:
             return False
 
     except Exception as e:
+        # The form is brittle, but the only thing that matters is whether the
+        # session is authenticated now. Check before declaring failure.
+        try:
+            if _is_logged_in(driver):
+                logger.info(f"Login step raised {type(e).__name__}, but the "
+                            "session is authenticated. Treating as success.")
+                return True
+        except Exception:
+            pass
         logger.error(f"Login error ({type(e).__name__}): {e}")
         return False
 
