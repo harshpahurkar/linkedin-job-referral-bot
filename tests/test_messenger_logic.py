@@ -38,6 +38,29 @@ def test_message_generation_stays_under_linkedin_limit_and_uses_jd_tech(monkeypa
     assert len(_pick_message(contact, job)) <= 300
 
 
+def test_note_cap_counts_emoji_the_way_linkedin_does(monkeypatch):
+    # LinkedIn counts UTF-16 units, so an emoji counts as 2. This note is
+    # 300 Python characters but 301 on LinkedIn.
+    template = "Hi {first_name}, " + "x" * 283 + " 🙏 {your_name}"
+    monkeypatch.setattr("messenger.Config.YOUR_NAME", "Harsh")
+    monkeypatch.setattr("messenger.Config.YOUR_SCHOOL", "")
+    monkeypatch.setattr("messenger.Config.REFERRAL_TEMPLATES", [template] * 13)
+    job = Job("job-1", "Backend Developer", "Acme", "Toronto, ON", "https://example.com/job")
+    contact = Contact(
+        "contact-1",
+        "Jane Doe",
+        "Jane",
+        "https://linkedin.com/in/jane-doe",
+        "Acme",
+        "Software Engineer",
+        "Toronto, Ontario, Canada",
+    )
+
+    message = _pick_message(contact, job)
+
+    assert len(message.encode("utf-16-le")) // 2 <= 300
+
+
 def test_contact_selection_filters_blocked_and_prefers_relevant_canadian_contacts():
     job = Job("job-1", "Software Engineer", "Acme", "Toronto, ON", "https://example.com/job")
     contacts = [

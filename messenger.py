@@ -367,6 +367,11 @@ _QA_POOL        = [0, 5, 6]
 _GENERAL_POOL   = [4, 5, 6]
 
 
+def _linkedin_len(text: str) -> int:
+    """Length as LinkedIn counts it: UTF-16 units, so an emoji counts as 2."""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def _pick_message(contact: Contact, job: Job) -> str:
     """
     Select and format the best message template for this contact + job.
@@ -457,13 +462,15 @@ def _pick_message(contact: Contact, job: Job) -> str:
         tech_snippet=tech_snippet,
     )
 
-    # Hard cap at 300 characters
-    if len(msg) > 300:
-        msg = msg[:297] + "..."
+    # Hard cap at 300 characters as LinkedIn counts them
+    if _linkedin_len(msg) > 300:
+        while _linkedin_len(msg) > 297:
+            msg = msg[:-1]
+        msg = msg.rstrip() + "..."
 
     logger.debug(
         f"  📝 Message for {contact.name}: role='{job_title}' "
-        f"company='{job.company}' tech='{tech_snippet}' [{len(msg)} chars]"
+        f"company='{job.company}' tech='{tech_snippet}' [{_linkedin_len(msg)} chars]"
     )
     return msg
 
@@ -904,6 +911,7 @@ def _extract_people_from_current_page(
             const links = document.querySelectorAll('a[href*="/in/"]');
             for (const link of links) {
                 if (!visible(link)) continue;
+                if (link.closest('[class*="msg-overlay"]')) continue;
 
                 const href = (link.href || '').split('?')[0].replace(/\/$/, '');
                 if (!href || seen.has(href)) continue;
@@ -1046,6 +1054,35 @@ def _save_contact_debug_snapshot(driver: webdriver.Chrome, company: str, stage: 
         pass
 
 
+# Employee cards on a company /people/ page. Chat bubbles reuse the same
+# lockup classes, so cards inside the messaging overlay are skipped.
+_PEOPLE_LOCKUP_JS = """
+    const results = [];
+    document.querySelectorAll('.artdeco-entity-lockup').forEach(card => {
+        if (card.closest('[class*="msg-overlay"]')) return;
+        const linkEl = card.querySelector('a[href*="/in/"]');
+        if (!linkEl) return;
+        const titleEl = card.querySelector('.artdeco-entity-lockup__title');
+        const subtitleEl = card.querySelector('.artdeco-entity-lockup__subtitle');
+        const captionEl = card.querySelector('.artdeco-entity-lockup__caption');
+        const name = titleEl ? (titleEl.innerText || titleEl.textContent || '').trim() : '';
+        const subtitle = subtitleEl ? (subtitleEl.innerText || subtitleEl.textContent || '').trim() : '';
+        const location = captionEl ? (captionEl.innerText || captionEl.textContent || '').trim() : '';
+        const link = linkEl.href.split('?')[0];
+        if (name && name.toLowerCase() !== 'linkedin member') {
+            results.push({
+                name: name,
+                title: subtitle,
+                location: location,
+                link: link,
+                card_text: (card.innerText || card.textContent || '').trim(),
+            });
+        }
+    });
+    return results;
+"""
+
+
 def _browse_company_people_page(
     driver: webdriver.Chrome,
     db: Database,
@@ -1172,30 +1209,7 @@ def _browse_company_people_page(
 
         # Extract ALL people using JS — artdeco-entity-lockup with /in/ links
         # Also grab location (caption element) for geo filtering
-        people_data = driver.execute_script("""
-            const results = [];
-            document.querySelectorAll('.artdeco-entity-lockup').forEach(card => {
-                const linkEl = card.querySelector('a[href*="/in/"]');
-                if (!linkEl) return;
-                const titleEl = card.querySelector('.artdeco-entity-lockup__title');
-                const subtitleEl = card.querySelector('.artdeco-entity-lockup__subtitle');
-                const captionEl = card.querySelector('.artdeco-entity-lockup__caption');
-                const name = titleEl ? (titleEl.innerText || titleEl.textContent || '').trim() : '';
-                const subtitle = subtitleEl ? (subtitleEl.innerText || subtitleEl.textContent || '').trim() : '';
-                const location = captionEl ? (captionEl.innerText || captionEl.textContent || '').trim() : '';
-                const link = linkEl.href.split('?')[0];
-                if (name && name.toLowerCase() !== 'linkedin member') {
-                    results.push({
-                        name: name,
-                        title: subtitle,
-                        location: location,
-                        link: link,
-                        card_text: (card.innerText || card.textContent || '').trim(),
-                    });
-                }
-            });
-            return results;
-        """)
+        people_data = driver.execute_script(_PEOPLE_LOCKUP_JS)
 
         if not people_data:
             logger.debug(f"  No people found via strict selector on {company} people page")
@@ -1507,7 +1521,7 @@ def _send_connection_with_note(
             return "contract_skip"
 
         # _get_connection_status scrolls to top internally
-        status = _get_connection_status(driver)
+        status = _get_connection_status(driver, contact.first_name)
         logger.debug(
             f"  Profile {contact.name}: connection status = '{status}', "
             f"URL = {driver.current_url}"
@@ -1625,13 +1639,13 @@ def _send_connection_with_note(
                     const tas = el.shadowRoot.querySelectorAll('textarea');
                     for (const ta of tas) {
                         const r = ta.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) return ta;
+                        if (r.width > 0 && r.height > 0 && !ta.closest('.msg-overlay-container')) return ta;
                     }
                     // contenteditable
                     const ces = el.shadowRoot.querySelectorAll('[contenteditable="true"]');
                     for (const ce of ces) {
                         const r = ce.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) return ce;
+                        if (r.width > 0 && r.height > 0 && !ce.closest('.msg-overlay-container')) return ce;
                     }
                 }
                 return null;
@@ -1820,6 +1834,9 @@ def _send_direct_message(
         except Exception:
             pass
 
+        # Close leftover bubbles so the overlay only holds this contact's chat
+        _close_msg_overlay(driver)
+
         # Click the "Message" button on the profile page
         # LinkedIn 2026 renders Message as <a>, not <button>
         msg_clicked = driver.execute_script("""
@@ -1851,38 +1868,52 @@ def _send_direct_message(
                 }
             }
             if (best) {
+                const info = {tag: best.tagName, text: (best.innerText || '').trim(),
+                              label: best.getAttribute('aria-label'), href: best.getAttribute('href')};
                 best.click();
-                return true;
+                return info;
             }
-            return false;
+            return null;
         """)
 
         if not msg_clicked:
             logger.debug(f"  No Message button found on {contact.name}'s profile")
             return False
+        logger.debug(f"  Clicked Message control: {msg_clicked}")
 
         human_delay(1.5, 3)
 
-        # Wait for the message input to appear (overlay or full page)
+        # Wait for this contact's composer (the overlay lives in a shadow root)
         msg_input = None
         for _ in range(8):
-            msg_input = driver.execute_script("""
-                const selectors = [
-                    'div.msg-form__contenteditable[contenteditable="true"]',
-                    'div[role="textbox"][contenteditable="true"]',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el && el.offsetParent !== null) return el;
-                }
-                return null;
-            """)
+            msg_input = _find_msg_input(driver, contact.first_name)
             if msg_input:
                 break
             time.sleep(0.5)
 
         if not msg_input:
-            logger.debug(f"  Message input not found for {contact.name}")
+            bubbles = driver.execute_script(_ALL_ROOTS_JS + r"""
+                return roots.flatMap(r => [...r.querySelectorAll('.msg-overlay-conversation-bubble')]
+                    .map(b => ({text: b.innerText.replace(/\s+/g, ' ').trim().slice(0, 120),
+                                editables: b.querySelectorAll('[contenteditable="true"]').length})));
+            """)
+            logger.debug(
+                f"  Message input not found for {contact.name} "
+                f"(url={driver.current_url}, bubbles={bubbles})"
+            )
+            _close_msg_overlay(driver)
+            return False
+
+        # Never re-pitch someone we already have a conversation with.
+        # Thread history loads a moment after the composer appears.
+        has_history = False
+        for _ in range(6):
+            has_history = _has_prior_messages(driver, msg_input)
+            if has_history:
+                break
+            time.sleep(0.5)
+        if has_history:
+            logger.info(f"  💬 Skipping DM to {contact.name}: conversation already exists")
             _close_msg_overlay(driver)
             return False
 
@@ -1897,34 +1928,7 @@ def _send_direct_message(
         # Click Send inside the messaging form
         send_clicked = False
         for _ in range(6):
-            send_clicked = driver.execute_script("""
-                // Try the dedicated send button class first
-                const sendBtns = document.querySelectorAll(
-                    'button.msg-form__send-button, button[type="submit"]'
-                );
-                for (const btn of sendBtns) {
-                    if (btn.offsetParent !== null && !btn.disabled) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                // Fallback: any Send button inside a messaging container
-                const all = document.querySelectorAll('button');
-                for (const btn of all) {
-                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-                    const text = btn.innerText.trim().toLowerCase();
-                    const inMsg = btn.closest(
-                        '.msg-form, .msg-overlay-conversation-bubble, '
-                        + '.msg-s-message-list-container'
-                    );
-                    if (inMsg && (label === 'send' || text === 'send')
-                        && btn.offsetParent !== null && !btn.disabled) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            """)
+            send_clicked = _click_msg_send(driver, msg_input)
             if send_clicked:
                 break
             time.sleep(0.5)
@@ -1945,22 +1949,73 @@ def _send_direct_message(
         return False
 
 
+# LinkedIn 2026 renders the messaging overlay inside a shadow root on
+# div.theme--light, so these lookups walk the document and every shadow root.
+_ALL_ROOTS_JS = """
+    const roots = [document];
+    for (let i = 0; i < roots.length; i++) {
+        roots[i].querySelectorAll('*').forEach(el => { if (el.shadowRoot) roots.push(el.shadowRoot); });
+    }
+"""
+
+
+def _find_msg_input(driver: webdriver.Chrome, first_name: str):
+    """Return the visible composer of the chat bubble addressed to this contact."""
+    return driver.execute_script(_ALL_ROOTS_JS + """
+        const name = arguments[0].toLowerCase();
+        for (const root of roots) {
+            for (const bubble of root.querySelectorAll('.msg-overlay-conversation-bubble')) {
+                const title = bubble.querySelector('.msg-overlay-bubble-header__title');
+                if (!title) continue;
+                const titleText = title.innerText.trim().toLowerCase();
+                // With no prior thread the bubble is titled "New message" and
+                // names the recipient inside it instead.
+                const addressed = titleText.includes(name) || (titleText === 'new message'
+                    && bubble.innerText.toLowerCase().replace('new message', '').includes(name));
+                if (!addressed) continue;
+                const input = bubble.querySelector('.msg-form__contenteditable[contenteditable="true"]');
+                if (input && input.offsetParent !== null) return input;
+            }
+        }
+        return null;
+    """, first_name)
+
+
+def _click_msg_send(driver: webdriver.Chrome, msg_input) -> bool:
+    """Click Send in the same form as the composer we typed into."""
+    return bool(driver.execute_script("""
+        const form = arguments[0].closest('form, .msg-form');
+        const btn = form && form.querySelector('button.msg-form__send-button, button[type="submit"]');
+        if (!btn || btn.disabled || btn.offsetParent === null) return false;
+        btn.click();
+        return true;
+    """, msg_input))
+
+
+def _has_prior_messages(driver: webdriver.Chrome, msg_input) -> bool:
+    """True when the composer's conversation already has messages in it."""
+    return bool(driver.execute_script("""
+        const bubble = arguments[0].closest('.msg-overlay-conversation-bubble');
+        return !!bubble && bubble.querySelectorAll('.msg-s-message-list__event').length > 0;
+    """, msg_input))
+
+
 def _close_msg_overlay(driver: webdriver.Chrome):
-    """Close the LinkedIn messaging overlay if open."""
+    """Close every open LinkedIn conversation bubble."""
     try:
-        driver.execute_script("""
-            const close = document.querySelector(
-                'button[data-control-name="overlay.close_conversation_window"], '
-                + '.msg-overlay-bubble-header__control--close-btn, '
-                + 'button[aria-label*="Close your conversation"]'
-            );
-            if (close) close.click();
+        driver.execute_script(_ALL_ROOTS_JS + """
+            for (const root of roots) {
+                for (const btn of root.querySelectorAll('.msg-overlay-conversation-bubble header button')) {
+                    const label = (btn.getAttribute('aria-label') || btn.innerText || '').toLowerCase();
+                    if (label.includes('close your conversation')) btn.click();
+                }
+            }
         """)
     except Exception:
         pass
 
 
-def _get_connection_status(driver: webdriver.Chrome) -> str:
+def _get_connection_status(driver: webdriver.Chrome, expected_name: str = "") -> str:
     """
     Detect the relationship with this profile.
     Returns: 'connect' (can connect), 'connected' (already), 'pending', or 'unknown'.
@@ -1982,6 +2037,8 @@ def _get_connection_status(driver: webdriver.Chrome) -> str:
     _t.sleep(0.5)
 
     result = driver.execute_script("""
+        const name = (arguments[0] || '').toLowerCase();
+
         // Phase 1: Scan <button>, <a>, and [role="button"] elements in the
         // profile action area.  LinkedIn 2026 renders Connect/Message as <a>
         // links styled as buttons, not actual <button> elements.
@@ -2011,6 +2068,10 @@ def _get_connection_status(driver: webdriver.Chrome) -> str:
             const text = (el.innerText || el.textContent || '').trim().toLowerCase();
             const label = (el.getAttribute('aria-label') || '').toLowerCase();
             const blob = text + ' ' + label;
+
+            // Invite and withdraw controls name the person they act on; skip
+            // ones for someone else, like "People you may know" cards.
+            if (name && label.includes('invit') && !label.includes(name)) continue;
 
             // Collect debug info for first 15 buttons
             if (debugBtns.length < 15) {
@@ -2064,6 +2125,7 @@ def _get_connection_status(driver: webdriver.Chrome) -> str:
                 if (text.length > 40) continue;
                 const textLower = text.toLowerCase();
                 const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                if (name && label.includes('invit') && !label.includes(name)) continue;
 
                 if (textLower === 'connect'
                     || (label.includes('invite') && label.includes('connect')
@@ -2096,7 +2158,7 @@ def _get_connection_status(driver: webdriver.Chrome) -> str:
             flags: {connect: hasConnectDirect, message: hasMessage, pending: hasPending, follow: hasFollow},
             buttons: debugBtns
         });
-    """) or '{"status":"unknown","flags":{},"buttons":[]}'
+    """, expected_name) or '{"status":"unknown","flags":{},"buttons":[]}'
 
     try:
         data = json.loads(result)
@@ -2129,6 +2191,10 @@ def _click_connect_button(driver: webdriver.Chrome, expected_name: str = "") -> 
     import time
     from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.common.by import By as _By
+
+    # Invite labels name the person they act on ("Invite X to connect"), and a
+    # profile also shows Connect for other people, like "People you may know".
+    name = expected_name.split()[0].lower() if expected_name.strip() else ""
 
     # Scroll to top so buttons are in viewport
     try:
@@ -2172,6 +2238,8 @@ def _click_connect_button(driver: webdriver.Chrome, expected_name: str = "") -> 
             if any(x in text for x in ["disconnect", "connections", "connected"]):
                 continue
             if any(x in label for x in ["disconnect", "connections", "connected"]):
+                continue
+            if name and "invit" in label and name not in label:
                 continue
             # Must be a real Connect button, not a "mutual connection" link.
             # Real buttons: text="Connect" (short), label="Invite X to connect"
@@ -2285,6 +2353,8 @@ def _click_connect_button(driver: webdriver.Chrome, expected_name: str = "") -> 
                         "remove", "block", "report", "unfollow"
                     ]):
                         continue
+                    if name and "invit" in label and name not in label:
+                        continue
                     connect_in_menu = item
                     break
             except Exception:
@@ -2342,6 +2412,8 @@ def _click_send_button(driver: webdriver.Chrome) -> bool:
                 for (const btn of btns) {
                     const r = btn.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) continue;
+                    // Chat bubbles share this shadow root; never click their Send
+                    if (btn.closest('.msg-overlay-container')) continue;
                     const text = (btn.innerText || '').trim().toLowerCase();
                     const label = (btn.getAttribute('aria-label') || '').toLowerCase();
                     const blob = label + ' ' + text;
