@@ -102,9 +102,10 @@ _COMPANY_BLACKLIST_KEYWORDS = {
 }
 
 # ── Constants ─────────────────────────────────────────────────────────
-# LinkedIn uses .scaffold-layout__list-item for ALL 25 cards per page (even
-# occluded ones).  .job-card-container only matches the ~7 that are rendered.
-CARD_SEL = ".scaffold-layout__list-item"
+# LinkedIn's 2026 search page renders all 25 cards per page as a role=button
+# div keyed by job id.  Server-rendered pages also wrap each card in
+# [data-view-name="job-search-job-card"]; client-rendered ones don't.
+CARD_SEL = '[role="button"][componentkey^="job-card-component-ref-"]'
 
 EXP_LEVEL_MAP = {
     "internship": "1",
@@ -712,6 +713,7 @@ def _scroll_page_cards(driver: webdriver.Chrome) -> list:
     """
     # Selectors for LinkedIn's pagination bar at the bottom of the job list
     _PAGINATION_SELS = (
+        '[data-testid="pagination-controls-list"]',  # 2026 search page
         "ul.artdeco-pagination__pages",         # standard pagination
         ".artdeco-pagination",                   # outer wrapper
         ".jobs-search-pagination",               # alternate class
@@ -812,48 +814,20 @@ def _extract_card_basics(card) -> tuple[str, str, str, str, str] | None:
                 return (el.innerText || el.textContent || '').trim().split('\\n')[0].trim();
             }
 
-            // Title + URL — always in the main <a> link
-            const titleLink = card.querySelector(
-                'a.job-card-list__title--link') ||
-                card.querySelector('a.job-card-container__link') ||
-                card.querySelector('.job-card-list__title a') ||
-                card.querySelector('a[href*="/jobs/view/"]');
-            if (!titleLink) return null;
-            const title = txt(titleLink);
-            const href  = (titleLink.href || '').split('?')[0];
+            // Job id is in componentkey="job-card-component-ref-<id>".
+            // Cards have no job link, and the first three <p> are title,
+            // company and location.
+            const jobNum = (card.getAttribute('componentkey') || '').split('-').pop();
+            const ps = card.querySelectorAll('p');
+            if (!/^\\d+$/.test(jobNum) || ps.length < 3) return null;
+
+            // The title <p> can also hold screen-reader text ("Selected, ",
+            // "(Verified job)"); its aria-hidden span is the visible title.
+            const title = txt(ps[0].querySelector('span[aria-hidden="true"]') || ps[0]);
             if (!title) return null;
+            const href = 'https://www.linkedin.com/jobs/view/' + jobNum + '/';
 
-            // Company — try specific selectors in priority order
-            let company = '';
-            const companySelectors = [
-                '.job-card-container__primary-description',
-                '.job-card-container__company-name',
-                '.artdeco-entity-lockup__subtitle',
-            ];
-            for (const sel of companySelectors) {
-                const el = card.querySelector(sel);
-                if (el) {
-                    company = txt(el);
-                    if (company) break;
-                }
-            }
-
-            // Location — try specific selectors in priority order
-            let location = '';
-            const locSelectors = [
-                '.job-card-container__metadata-wrapper',
-                '.job-card-container__metadata-item',
-                '.artdeco-entity-lockup__caption',
-            ];
-            for (const sel of locSelectors) {
-                const el = card.querySelector(sel);
-                if (el) {
-                    location = txt(el);
-                    if (location) break;
-                }
-            }
-
-            return {title, href, company: company || 'Unknown', location};
+            return {title, href, company: txt(ps[1]) || 'Unknown', location: txt(ps[2])};
         """, card)
 
         if not data:
@@ -897,6 +871,10 @@ def _extract_card_basics(card) -> tuple[str, str, str, str, str] | None:
 def _click_and_get_description(driver: webdriver.Chrome, card) -> str:
     """Click a job card so the detail panel loads, then extract the description."""
     try:
+        # The detail panel is keyed by job id, so a previous job's panel
+        # still on screen is never read by mistake.
+        job_num = (card.get_attribute("componentkey") or "").rsplit("-", 1)[-1]
+
         # Scroll the card into view first so it's rendered and clickable
         driver.execute_script(
             "arguments[0].scrollIntoView({block:'center'});", card
@@ -914,15 +892,12 @@ def _click_and_get_description(driver: webdriver.Chrome, card) -> str:
 
         # Try several possible selectors for the description panel
         _DESC_SELECTORS = [
-            "#job-details",
-            ".jobs-description-content__text",
-            ".jobs-description__content",
-            ".jobs-box__html-content",
+            f'[id="JobDetails_AboutTheJob_{job_num}"] [data-testid="expandable-text-box"]',
         ]
 
         for sel in _DESC_SELECTORS:
             try:
-                el = WebDriverWait(driver, 2).until(
+                el = WebDriverWait(driver, 5).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, sel))
                 )
                 text = el.text.strip()
