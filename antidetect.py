@@ -315,7 +315,15 @@ def check_for_linkedin_warnings(driver: webdriver.Chrome) -> tuple[bool, str]:
         return True, session.warning_reason
 
     try:
-        # 1. Check page title for error indicators
+        # 1. Check for Chrome's error page (LinkedIn answered with HTTP 429)
+        page_text = driver.execute_script(
+            "return document.body ? document.body.innerText.slice(0, 500) : '';"
+        )
+        if page_text and "HTTP ERROR 429" in page_text:
+            reason = "LinkedIn rate limited this session (HTTP 429)"
+            session.flag_warning(reason)
+            logger.critical(f"🚨 LINKEDIN WARNING DETECTED: {reason}")
+            return True, reason
 
         # 2. Check URL for redirect to security/restriction pages
         url = driver.current_url.lower()
