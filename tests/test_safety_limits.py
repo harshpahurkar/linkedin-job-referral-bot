@@ -16,6 +16,12 @@ class DummyDb:
     def already_messaged(self, _contact_id):
         return False
 
+    def sent_today_at(self, _company):
+        return 0
+
+    def viewed_this_week(self, _profile_url):
+        return False
+
     def insert_contact(self, _contact):
         return True
 

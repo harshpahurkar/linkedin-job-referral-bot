@@ -42,7 +42,7 @@ class Config:
 
     # How far back to search for job postings (default: 1 week)
     # Wider window = way more jobs per scrape = bigger pool to rank.
-    JOB_POSTED_WITHIN: str = os.getenv("JOB_POSTED_WITHIN", "r604800")
+    JOB_POSTED_WITHIN: str = os.getenv("JOB_POSTED_WITHIN", "r172800")
 
     # ── Referral Outreach ─────────────────────────────────────────────
     # CONSERVATIVE limits — the old version ran 25–40/day with 180/week
@@ -86,6 +86,8 @@ class Config:
 
     # ── Browser ───────────────────────────────────────────────────────
     HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
+    # Headed Chrome parked outside the screen. Set OFFSCREEN=false to watch a run.
+    OFFSCREEN: bool = os.getenv("OFFSCREEN", "true").lower() == "true"
     CHROME_PROFILE_PATH: str = os.getenv("CHROME_PROFILE_PATH", "")
 
     # ── Database ──────────────────────────────────────────────────────

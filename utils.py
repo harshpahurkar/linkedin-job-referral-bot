@@ -95,6 +95,13 @@ _BOT_PROFILES_ROOT = Path(Config.CHROME_PROFILE_PATH).parent / "chrome-bot-profi
 _PERSISTENT_PROFILE = _BOT_PROFILES_ROOT / "persistent"
 
 
+# A normal headed Chrome, parked where no monitor is. Headless Chrome is easier
+# to fingerprint, and this keeps the window out of the way just as well.
+OFFSCREEN_ARGS = [
+    "--window-position=-32000,-32000",
+]
+
+
 def create_driver() -> webdriver.Chrome:
     """Spin up a Chrome driver with a fresh, disposable profile.
 
@@ -106,6 +113,9 @@ def create_driver() -> webdriver.Chrome:
 
     if Config.HEADLESS:
         opts.add_argument("--headless=new")
+    elif Config.OFFSCREEN:
+        for arg in OFFSCREEN_ARGS:
+            opts.add_argument(arg)
 
     # Persistent profile — reused across runs so LinkedIn sees an
     # established browser with cookies, cache, and history.  A fresh

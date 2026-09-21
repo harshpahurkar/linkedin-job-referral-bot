@@ -6,14 +6,17 @@ Usage:
     python main.py --schedule   Run daily on a schedule
     python main.py --dry-run    Scrape only, no messages sent
     python main.py --humanized-start   Enable skip-day and startup jitter
+    python main.py --workday    Work toward today's target in small sessions, 08:00 to 17:00
 """
 
 import argparse
+import json
 import random
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from config import Config
 from models import Database
@@ -25,6 +28,7 @@ from scheduler import start_scheduler
 from antidetect import (
     reset_session, get_session, is_session_safe,
     check_for_linkedin_warnings, simulate_natural_break,
+    frozen_reason, FREEZE_FILE,
 )
 
 logger = get_logger("main")
@@ -90,6 +94,73 @@ def _weekend_volume_adjustment(base_min: int, base_max: int) -> tuple[int, int]:
     return new_min, new_max
 
 
+# ── Unattended workday mode ──────────────────────────────────────────
+# The day's volume climbs slowly and is spread over short sessions.
+
+RAMP_FILE = Path(__file__).parent / "data" / "ramp.json"
+RAMP_START, RAMP_STEP, RAMP_CEILING = 30, 5, 50
+WORKDAY_START_HOUR, WORKDAY_END_HOUR = 8, 17
+
+
+def todays_target(state_file: Path = RAMP_FILE, today: date | None = None) -> tuple[int, int]:
+    """Return (level, target) for today.
+
+    The level grows by RAMP_STEP on each day the bot runs, up to RAMP_CEILING.
+    The target is what today aims for: the level, less a little so days
+    differ, and cut on weekends. It is saved so every run in a day works
+    toward the same number. Delete the file to restart the ramp.
+    """
+    today = today or date.today()
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    if state.get("date") != today.isoformat():
+        level = min(state.get("level", RAMP_START - RAMP_STEP) + RAMP_STEP, RAMP_CEILING)
+        low, high = _weekend_volume_adjustment(level - 4, level)
+        state = {"date": today.isoformat(), "level": level, "target": random.randint(low, high)}
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state))
+    return state["level"], state["target"]
+
+
+def session_size(now: datetime, target: int, sent: int, frozen: str) -> int:
+    """How many people the next session may contact. 0 means no session now."""
+    end = now.replace(hour=WORKDAY_END_HOUR, minute=0, second=0, microsecond=0)
+    # A session needs about 40 minutes to be worth its login and warm-up.
+    if frozen or now.hour < WORKDAY_START_HOUR or now > end - timedelta(minutes=40):
+        return 0
+    return max(0, min(target - sent, random.randint(12, 18)))
+
+
+def run_workday():
+    """Run short sessions until today's target is met or the workday ends.
+
+    Task Scheduler starts this at logon, at unlock and at 08:00. It exits
+    whenever there is nothing to do, and the next trigger starts it again.
+    """
+    time.sleep(random.uniform(20, 90))  # not the second the desktop appears
+    while True:
+        now = datetime.now()
+        # Asking for the target moves the ramp, so check the clock and the freeze first.
+        if session_size(now, RAMP_CEILING, 0, frozen_reason()) == 0:
+            logger.info("🗓️  Workday: outside 08:00 to 17:00, or frozen. Nothing to do.")
+            return
+        db = Database()
+        sent = db.sends_today()
+        db.close()
+        level, target = todays_target()
+        size = session_size(now, target, sent, frozen_reason())
+        logger.info(f"🗓️  Workday: {sent}/{target} sent today (ramp level {level}), next session: {size}")
+        if size == 0:
+            return
+        stop_at = now.replace(hour=WORKDAY_END_HOUR, minute=0, second=0, microsecond=0)
+        if run_pipeline(max_sends=size, stop_at=stop_at) is None:
+            logger.warning("Session did not finish. Waiting for the next logon, unlock or 08:00.")
+            return
+        resume = datetime.now() + timedelta(minutes=random.uniform(5, 15))
+        logger.info(f"☕ Next session around {resume:%H:%M}.")
+        while datetime.now() < resume:  # short ticks: one long sleep stalls across suspend
+            time.sleep(30)
+
+
 def _warmup_browse(driver):
     """Spend 30–90 seconds browsing LinkedIn like a normal user.
 
@@ -102,7 +173,7 @@ def _warmup_browse(driver):
     """
     from antidetect import natural_scroll_pattern, _maybe_like_feed_post, safe_get
 
-    warmup_duration = random.uniform(120, 300)  # 2-5 minutes total
+    warmup_duration = random.uniform(60, 120)  # 1-2 minutes total
     logger.info(f"🏃 Warm-up: browsing feed & notifications (~{warmup_duration/60:.1f} min) …")
     start = time.time()
 
@@ -173,14 +244,16 @@ def _cleanup_stale_chrome():
     killed = False
     try:
         import subprocess
-        # WMIC finds Chrome processes by their command-line args
+        # Find Chrome processes by their command-line args (wmic is gone from Windows 11)
         result = subprocess.run(
             [
-                "wmic", "process", "where",
-                "name='chrome.exe' and commandline like '%chrome-bot-profiles%'",
-                "get", "processid",
+                "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+                "Where-Object CommandLine -like '*chrome-bot-profiles*' | "
+                "ForEach-Object ProcessId",
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         for line in result.stdout.strip().splitlines():
             pid = line.strip()
@@ -188,6 +261,7 @@ def _cleanup_stale_chrome():
                 subprocess.run(
                     ["taskkill", "/F", "/PID", pid],
                     capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 killed = True
                 logger.info(f"   Killed bot Chrome PID {pid}")
@@ -198,6 +272,7 @@ def _cleanup_stale_chrome():
         subprocess.run(
             ["taskkill", "/F", "/IM", "chromedriver.exe"],
             capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception:
         pass
@@ -207,8 +282,26 @@ def _cleanup_stale_chrome():
         logger.info("   No stale bot processes found — clean start.")
 
 
-def run_pipeline(dry_run: bool = False, force_now: bool = True):
-    """Execute the full scrape → message pipeline once."""
+def run_pipeline(
+    dry_run: bool = False,
+    force_now: bool = True,
+    max_sends: int | None = None,
+    stop_at: datetime | None = None,
+) -> int | None:
+    """Execute the full scrape → message pipeline once.
+
+    Returns how many messages went out, or None if the run stopped early.
+    ``max_sends`` replaces the random daily target (workday mode passes one
+    session's share). Nobody new is contacted after ``stop_at``.
+    """
+    frozen = frozen_reason()
+    if frozen:
+        logger.critical(
+            f"🧊 Frozen after a LinkedIn warning ({frozen}). "
+            f"Check the account, then delete {FREEZE_FILE} to resume."
+        )
+        return None
+
     logger.info("=" * 60)
     logger.info("🚀 Starting LinkedIn Job Referral Bot")
     logger.info("=" * 60)
@@ -262,6 +355,8 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
             Config.DAILY_TARGET_MIN, Config.DAILY_TARGET_MAX,
         )
         daily_target = random.randint(day_min, day_max)
+        if max_sends is not None:
+            day_min = day_max = daily_target = max_sends
         Config.MAX_MESSAGES_PER_DAY = daily_target
         est_companies = daily_target // Config.MAX_MESSAGES_PER_COMPANY
         day_name = datetime.now().strftime("%A")
@@ -386,7 +481,8 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
                 # runs once per time window, and a per-window count that reset
                 # to zero each batch let a day overshoot its target.
                 batch_sent = find_and_message_employees(
-                    driver, db, batch, max_to_send=daily_target - total_msgs_sent
+                    driver, db, batch, max_to_send=daily_target - total_msgs_sent,
+                    stop_at=stop_at,
                 )
                 total_msgs_sent += batch_sent
                 logger.info(
@@ -395,6 +491,9 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
                 )
 
             # ── Check if daily target is hit ──────────────────────
+            if stop_at and datetime.now() >= stop_at:
+                logger.info("🕔 Workday over. Skipping remaining time windows.")
+                break
             if total_msgs_sent >= daily_target:
                 logger.info(
                     f"🎯 Daily target reached ({total_msgs_sent}/{daily_target})! "
@@ -407,6 +506,7 @@ def run_pipeline(dry_run: bool = False, force_now: bool = True):
             f"🏁 Pipeline complete: {total_jobs_found} jobs found, "
             f"{total_msgs_sent} messages sent."
         )
+        return total_msgs_sent
 
     except KeyboardInterrupt:
         import traceback
@@ -444,9 +544,16 @@ def main():
         action="store_true",
         help="Enable skip-day and random startup jitter before run",
     )
+    parser.add_argument(
+        "--workday",
+        action="store_true",
+        help="Work toward today's target in small sessions between 08:00 and 17:00",
+    )
     args = parser.parse_args()
 
-    if args.schedule:
+    if args.workday:
+        run_workday()
+    elif args.schedule:
         logger.info("Starting in SCHEDULED mode …")
         # Scheduled mode keeps humanized startup behavior by default.
         start_scheduler(lambda: run_pipeline(dry_run=args.dry_run, force_now=False))

@@ -20,6 +20,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
@@ -28,6 +29,17 @@ from selenium.webdriver.common.by import By
 from utils import get_logger
 
 logger = get_logger("antidetect")
+
+# Written on any LinkedIn warning. While it exists the bot refuses to run, so a
+# warning outlives the run that saw it. Delete the file to resume.
+FREEZE_FILE = Path(__file__).parent / "data" / "FROZEN.txt"
+
+
+def frozen_reason() -> str:
+    """Why the bot is frozen, or "" when it is free to run."""
+    if not FREEZE_FILE.exists():
+        return ""
+    return FREEZE_FILE.read_text(encoding="utf-8").strip() or "unknown warning"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -149,6 +161,9 @@ class SessionTracker:
     def flag_warning(self, reason: str):
         self.linkedin_warning_detected = True
         self._warning_reason = reason
+        FREEZE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with FREEZE_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M} {reason}\n")
 
     @property
     def warning_reason(self) -> str:

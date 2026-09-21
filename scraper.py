@@ -174,7 +174,7 @@ def build_search_url(
     return "https://www.linkedin.com/jobs/search/?" + urllib.parse.urlencode(params)
 
 
-MAX_PAGES = 5  # up to 5 pages per keyword×location — scrape everything possible
+MAX_PAGES = 3  # 3 pages per keyword×location keeps sessions short
 
 
 # ── Cascading time windows ────────────────────────────────────────────

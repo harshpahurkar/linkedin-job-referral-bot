@@ -8,6 +8,7 @@ import json
 import random
 import re
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 from selenium import webdriver
@@ -74,6 +75,7 @@ def find_and_message_employees(
     db: Database,
     jobs: list[Job],
     max_to_send: int | None = None,
+    stop_at: datetime | None = None,
 ) -> int:
     """
     For each new job, search LinkedIn for employees at that company
@@ -84,6 +86,8 @@ def find_and_message_employees(
     budget — otherwise each window starts its count from zero and the day's
     total can run to several times the target before the caller notices.
     Defaults to the full daily cap for a single-batch caller.
+
+    ``stop_at`` is a wall-clock cutoff: nobody new is contacted after it.
     """
     day_cap = Config.MAX_MESSAGES_PER_DAY if max_to_send is None else max_to_send
     if day_cap <= 0:
@@ -162,9 +166,14 @@ def find_and_message_employees(
             logger.info(f"  → No reachable contacts found at {company}")
             continue
 
-        sent_at_company = 0
+        # Several runs share a day, so the cap counts earlier runs too.
+        sent_at_company = db.sent_today_at(company)
         for contact in contacts:
             if total_sent >= day_cap:
+                break
+            if stop_at and datetime.now() >= stop_at:
+                logger.info("🛑 Past the stop time. Ending outreach.")
+                weekly_limit_hit = True  # reuse flag to break outer loop too
                 break
             if (weekly_connections + connections_today) >= Config.MAX_CONNECTIONS_PER_WEEK:
                 break
@@ -186,6 +195,12 @@ def find_and_message_employees(
             # Skip contacts with no profile URL (bad extraction)
             if not contact.profile_url:
                 logger.debug(f"  → No profile URL for {contact.name}, skipping.")
+                continue
+
+            # Several runs a day scrape the same companies. Opening the same
+            # profile run after run helps nobody and looks automated.
+            if db.viewed_this_week(contact.profile_url):
+                logger.debug(f"  → Viewed {contact.name} this week already, skipping.")
                 continue
 
             db.insert_contact(contact)
@@ -217,6 +232,7 @@ def find_and_message_employees(
             result = _send_connection_with_note(driver, contact, message)
             if result == "weekly_limit":
                 logger.critical("🛑 Weekly invitation limit hit — stopping all outreach!")
+                get_session().flag_warning("weekly invitation limit")
                 weekly_limit_hit = True
                 break
             if result == "contract_skip":
@@ -996,6 +1012,15 @@ def _extract_people_from_current_page(
     return []
 
 
+def _clean_person_name(raw: str) -> str:
+    """Cut a card's link text down to the person's name."""
+    name = re.split(r"\n|\s·\s", raw.strip())[0].strip()
+    name = re.sub(r"\s+works here$", "", name)
+    if re.match(r"\d+ employees? ", name):  # insight cards end with the first name
+        name = name.split()[-1]
+    return name
+
+
 def _build_contacts_from_people_data(
     company: str,
     people_data: list[dict],
@@ -1018,8 +1043,13 @@ def _build_contacts_from_people_data(
         if strict_company_match and not _person_matches_expected_company(person, company):
             continue
 
-        first_name = name.split()[0] if name else "there"
+        # The id keeps the raw text: ids already in the DB were built from it, and
+        # a changed id would make an already-messaged person look new.
         contact_id = hashlib.md5(f"{name}|{profile_url}".encode()).hexdigest()[:16]
+        name = _clean_person_name(name)
+        if not name:
+            continue
+        first_name = name.split()[0]
         if contact_id in seen_ids:
             continue
 

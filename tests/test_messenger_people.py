@@ -50,3 +50,20 @@ def test_people_page_lockups_skip_the_chat_overlay(page):
 def test_structural_fallback_skips_the_chat_overlay(page):
     people = _extract_people_from_current_page(page, "test")
     assert [p["link"] for p in people] == ["https://www.linkedin.com/in/jane-doe"]
+
+
+# Link text seen live on people pages and search cards. Only the name may reach
+# the contact, because the first name opens the note ("Hi Vicky,").
+@pytest.mark.parametrize("raw, name, first", [
+    ("Jane Doe", "Jane Doe", "Jane"),
+    ("Udit Kapoor · 2nd Software Engineer at Texas Instruments", "Udit Kapoor", "Udit"),
+    ("Masud Aftab \n1st degree connection\n·\xa01st", "Masud Aftab", "Masud"),
+    ("Davyd works here", "Davyd", "Davyd"),
+    ("1 employee attended Seneca Polytechnic Vicky", "Vicky", "Vicky"),
+    ("2 employees who studied Computer Science Fazila", "Fazila", "Fazila"),
+])
+def test_contact_names_drop_the_rest_of_the_card(raw, name, first):
+    from messenger import _build_contacts_from_people_data
+    [contact] = _build_contacts_from_people_data(
+        "Acme", [{"name": raw, "link": "https://www.linkedin.com/in/x"}], max_results=5)
+    assert (contact.name, contact.first_name) == (name, first)

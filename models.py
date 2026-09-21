@@ -5,7 +5,7 @@ Data models for jobs, companies, and contacts — stored in SQLite.
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from config import Config
@@ -250,6 +250,33 @@ class Database:
 
     def weekly_connections_sent(self) -> int:
         return self.get_weekly_count("connection_request")
+
+    def sends_today(self) -> int:
+        """Invites and DMs sent since midnight. The day's target counts both."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM weekly_activity WHERE action_date >= ? "
+            "AND action_type IN ('connection_request', 'direct_message')",
+            (date.today().isoformat(),),
+        ).fetchone()
+        return row["cnt"]
+
+    def viewed_this_week(self, profile_url: str) -> bool:
+        """True if we opened this profile in the last 7 days."""
+        row = self.conn.execute(
+            "SELECT 1 FROM weekly_activity WHERE action_type = 'profile_view' "
+            "AND detail = ? AND action_date >= ?",
+            (profile_url, (datetime.now() - timedelta(days=7)).isoformat()),
+        ).fetchone()
+        return row is not None
+
+    def sent_today_at(self, company: str) -> int:
+        """People at this company messaged since midnight, across all of today's runs."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM contacts "
+            "WHERE company = ? AND messaged = 1 AND message_date >= ?",
+            (company, date.today().isoformat()),
+        ).fetchone()
+        return row["cnt"]
 
     def close(self):
         self.conn.close()

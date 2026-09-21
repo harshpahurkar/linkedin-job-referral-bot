@@ -85,6 +85,18 @@ Start-Process -FilePath "C:\Users\Harsh\Desktop\Projects\.venv\Scripts\python.ex
 Start-Process -FilePath "C:\Users\Harsh\Desktop\Projects\.venv\Scripts\python.exe" -ArgumentList "main.py --dry-run" -WorkingDirectory "C:\Users\Harsh\Desktop\Projects\linkedin-job-referral-bot"
 ```
 
+### Option D: Unattended, every workday
+
+```powershell
+.\install_task.ps1
+```
+
+This registers a scheduled task that starts `main.py --workday` with no window at logon, at unlock and at 08:00. Between 08:00 and 17:00 the bot works toward the day's target in sessions of 12 to 18 people, 5 to 15 minutes apart, in a normal Chrome window parked outside the screen (`OFFSCREEN=false` in `.env` brings it back). Outside those hours it exits at once.
+
+- **Daily target:** starts at 30, grows by 5 on each day the bot runs, and stops growing at 50. `MAX_CONNECTIONS_PER_WEEK` still applies. The state is in `data\ramp.json`; delete it to restart the ramp.
+- **Freeze:** any LinkedIn warning (rate limit, checkpoint, CAPTCHA, weekly invitation limit) writes `data\FROZEN.txt`, and the bot refuses to run while that file exists. Check the account in your own browser, then delete the file to resume.
+- **Pause:** `Disable-ScheduledTask -TaskName "LinkedIn Referral Bot"`. **Remove:** `Unregister-ScheduledTask -TaskName "LinkedIn Referral Bot" -Confirm:$false`.
+
 ---
 
 ## 📊 Monitor Progress
