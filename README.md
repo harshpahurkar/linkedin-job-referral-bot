@@ -95,6 +95,7 @@ This registers a scheduled task that starts `main.py --workday` with no window a
 
 - **Daily target:** starts at 30, grows by 5 on each day the bot runs, and stops growing at 50. `MAX_CONNECTIONS_PER_WEEK` still applies. The state is in `data\ramp.json`; delete it to restart the ramp.
 - **Freeze:** any LinkedIn warning (rate limit, checkpoint, CAPTCHA, weekly invitation limit) writes `data\FROZEN.txt`, and the bot refuses to run while that file exists. Check the account in your own browser, then delete the file to resume.
+- **Old invites:** at the end of each session the bot withdraws up to 25 invites that have been pending 2 weeks or more, with human pauses between them. LinkedIn blocks re-inviting a withdrawn person for up to 3 weeks.
 - **Pause:** `Disable-ScheduledTask -TaskName "LinkedIn Referral Bot"`. **Remove:** `Unregister-ScheduledTask -TaskName "LinkedIn Referral Bot" -Confirm:$false`.
 
 ---

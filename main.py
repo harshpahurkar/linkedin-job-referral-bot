@@ -24,6 +24,7 @@ from utils import get_logger, create_driver, cleanup_driver, purge_old_profiles,
 from auth import login
 from scraper import scrape_jobs, scrape_jobs_by_window
 from messenger import find_and_message_employees
+from withdraw import withdraw_stale_invites
 from scheduler import start_scheduler
 from antidetect import (
     reset_session, get_session, is_session_safe,
@@ -500,6 +501,14 @@ def run_pipeline(
                     f"Skipping remaining time windows."
                 )
                 break
+
+        # Clear invites nobody accepted in two weeks. A failure here must not
+        # cost the session, which already did its real work.
+        if is_session_safe():
+            try:
+                withdraw_stale_invites(driver)
+            except Exception as e:
+                logger.warning(f"Withdrawing old invites failed: {e}")
 
         db.log_run(jobs_found=total_jobs_found, messages_sent=total_msgs_sent)
         logger.info(
