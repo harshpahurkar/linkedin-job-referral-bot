@@ -102,10 +102,11 @@ _COMPANY_BLACKLIST_KEYWORDS = {
 }
 
 # ── Constants ─────────────────────────────────────────────────────────
-# LinkedIn's 2026 search page renders all 25 cards per page as a role=button
-# div keyed by job id.  Server-rendered pages also wrap each card in
-# [data-view-name="job-search-job-card"]; client-rendered ones don't.
-CARD_SEL = '[role="button"][componentkey^="job-card-component-ref-"]'
+# LinkedIn serves two search pages and switches between them.  The 2026 one
+# renders each card as a role=button div keyed by job id; the classic one uses
+# .scaffold-layout__list-item for all 25 cards (even occluded ones).
+CARD_SEL = ('[role="button"][componentkey^="job-card-component-ref-"], '
+            '.scaffold-layout__list-item')
 
 EXP_LEVEL_MAP = {
     "internship": "1",
@@ -814,10 +815,40 @@ def _extract_card_basics(card) -> tuple[str, str, str, str, str] | None:
                 return (el.innerText || el.textContent || '').trim().split('\\n')[0].trim();
             }
 
-            // Job id is in componentkey="job-card-component-ref-<id>".
+            // Classic page: title + URL are in the main <a> link, company
+            // and location in the entity lockup.
+            if (!card.hasAttribute('componentkey')) {
+                const titleLink = card.querySelector(
+                    'a.job-card-list__title--link') ||
+                    card.querySelector('a.job-card-container__link') ||
+                    card.querySelector('.job-card-list__title a') ||
+                    card.querySelector('a[href*="/jobs/view/"]');
+                if (!titleLink) return null;
+                const title = txt(titleLink);
+                if (!title) return null;
+                const first = sels => {
+                    for (const sel of sels) {
+                        const el = card.querySelector(sel);
+                        if (el && txt(el)) return txt(el);
+                    }
+                    return '';
+                };
+                return {
+                    title,
+                    href: (titleLink.href || '').split('?')[0],
+                    company: first(['.job-card-container__primary-description',
+                                    '.job-card-container__company-name',
+                                    '.artdeco-entity-lockup__subtitle']) || 'Unknown',
+                    location: first(['.job-card-container__metadata-wrapper',
+                                     '.job-card-container__metadata-item',
+                                     '.artdeco-entity-lockup__caption']),
+                };
+            }
+
+            // 2026 page: job id is in componentkey="job-card-component-ref-<id>".
             // Cards have no job link, and the first three <p> are title,
             // company and location.
-            const jobNum = (card.getAttribute('componentkey') || '').split('-').pop();
+            const jobNum = card.getAttribute('componentkey').split('-').pop();
             const ps = card.querySelectorAll('p');
             if (!/^\\d+$/.test(jobNum) || ps.length < 3) return null;
 
@@ -891,9 +922,17 @@ def _click_and_get_description(driver: webdriver.Chrome, card) -> str:
         human_delay(0.8, 1.2)  # quick pause for panel to load
 
         # Try several possible selectors for the description panel
-        _DESC_SELECTORS = [
-            f'[id="JobDetails_AboutTheJob_{job_num}"] [data-testid="expandable-text-box"]',
-        ]
+        if job_num.isdigit():
+            _DESC_SELECTORS = [
+                f'[id="JobDetails_AboutTheJob_{job_num}"] [data-testid="expandable-text-box"]',
+            ]
+        else:  # classic search page
+            _DESC_SELECTORS = [
+                "#job-details",
+                ".jobs-description-content__text",
+                ".jobs-description__content",
+                ".jobs-box__html-content",
+            ]
 
         for sel in _DESC_SELECTORS:
             try:

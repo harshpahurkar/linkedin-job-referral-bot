@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import json
+import msvcrt
 import random
 import subprocess
 import sys
@@ -559,6 +560,16 @@ def main():
         help="Work toward today's target in small sessions between 08:00 and 17:00",
     )
     args = parser.parse_args()
+
+    # Two bots would share one Chrome profile and one account, and each kills
+    # the other's browser. Windows drops this lock when the process exits.
+    Path("data").mkdir(exist_ok=True)
+    lock = open("data/bot.lock", "w")
+    try:
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        logger.info("Another bot is already running. Exiting.")
+        sys.exit(3)
 
     if args.workday:
         run_workday()

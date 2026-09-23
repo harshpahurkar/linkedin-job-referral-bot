@@ -47,3 +47,34 @@ def test_card_selector_and_extraction_read_the_2026_job_card(browser):
         "Toronto, ON (Hybrid)",
         "https://www.linkedin.com/jobs/view/4465251321/",
     )
+
+
+# The classic search page LinkedIn still serves to this account on some days.
+_CLASSIC_CARD_HTML = """
+<ul>
+  <li class="scaffold-layout__list-item">
+    <div class="job-card-container">
+      <a class="job-card-list__title--link" href="https://www.linkedin.com/jobs/view/4465251322/?refId=abc">
+        <span aria-hidden="true"><strong>Backend Developer</strong></span>
+      </a>
+      <div class="artdeco-entity-lockup__subtitle"><span>Shopify</span></div>
+      <div class="artdeco-entity-lockup__caption"><ul><li><span>Ottawa, ON (Remote)</span></li></ul></div>
+    </div>
+  </li>
+</ul>
+"""
+
+
+def test_card_selector_and_extraction_read_the_classic_job_card(browser):
+    browser.get("data:text/html;charset=utf-8," + urllib.parse.quote(_CLASSIC_CARD_HTML))
+
+    cards = browser.find_elements(By.CSS_SELECTOR, CARD_SEL)
+    assert len(cards) == 1
+
+    _job_id, title, company, location, url = _extract_card_basics(cards[0])
+    assert (title, company, location, url) == (
+        "Backend Developer",
+        "Shopify",
+        "Ottawa, ON (Remote)",
+        "https://www.linkedin.com/jobs/view/4465251322/",
+    )

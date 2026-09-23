@@ -8,7 +8,8 @@ Automated pipeline that scrapes LinkedIn job listings, finds employees at target
 
 ## 🚀 Quick Start (One Click)
 
-**Double-click `run.bat`** — that's it. It cleans old data, launches Chrome, scrapes jobs, and starts sending referral requests.
+**Double-click `run.bat`** — it starts the current workday mode, which runs
+short sessions toward the day's target between 08:00 and 17:00.
 
 ---
 
@@ -62,27 +63,30 @@ CHROME_PROFILE_PATH=C:\Users\Harsh\AppData\Local\Google\Chrome\User Data
 
 ### Option A: Double-click the launcher (recommended)
 
-Just double-click **`run.bat`**. It will:
-1. Kill any existing Chrome instances
-2. Clean old log/db files for a fresh run
-3. Launch the bot
+Just double-click **`run.bat`**. It launches the current **workday mode**:
+short sessions between 08:00 and 17:00, with 5–15 minute breaks, toward
+today's target. Outside those hours it exits without doing anything.
+
+To use another CLI mode from a terminal, pass it through the launcher:
+
+```powershell
+.\run.bat --dry-run
+.\run.bat --schedule
+```
 
 ### Option B: Run from terminal
 
 ```powershell
 cd linkedin-job-referral-bot
 
-# Clean old data
-Remove-Item data\logs\bot.log, data\jobs.db -ErrorAction SilentlyContinue
-
 # Launch (use Start-Process to avoid SIGINT crash in VS Code terminal)
-Start-Process -FilePath "C:\Users\Harsh\Desktop\Projects\.venv\Scripts\python.exe" -ArgumentList "main.py" -WorkingDirectory "C:\Users\Harsh\Desktop\Projects\linkedin-job-referral-bot"
+Start-Process -FilePath ".\.venv\Scripts\python.exe" -ArgumentList "main.py --workday" -WorkingDirectory (Get-Location)
 ```
 
 ### Option C: Dry run (scrape only, no messages)
 
 ```powershell
-Start-Process -FilePath "C:\Users\Harsh\Desktop\Projects\.venv\Scripts\python.exe" -ArgumentList "main.py --dry-run" -WorkingDirectory "C:\Users\Harsh\Desktop\Projects\linkedin-job-referral-bot"
+Start-Process -FilePath ".\.venv\Scripts\python.exe" -ArgumentList "main.py --dry-run" -WorkingDirectory (Get-Location)
 ```
 
 ### Option D: Unattended, every workday
